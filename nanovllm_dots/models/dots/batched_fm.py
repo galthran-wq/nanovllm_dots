@@ -34,6 +34,7 @@ def batched_flow_matching(
     guidance_scale: float = 1.2,
     ode_method: str = "euler",
     noise: torch.Tensor | None = None,
+    vfp=None,
 ) -> torch.Tensor:
     """Integrate the CFG flow-matching ODE for N requests -> [N, patch, latent].
 
@@ -45,6 +46,8 @@ def batched_flow_matching(
     latent_start = input_sequence.size(1) - patch_size
     device, dtype = input_sequence.device, input_sequence.dtype
     gs = input_sequence.new_tensor(float(guidance_scale))
+    if vfp is None:
+        vfp = core.velocity_field_predictor
 
     # CFG pairing: rows [0:n] conditioned, [n:2n] unconditioned. Masks/positions
     # are shared between a request's two branches; g_cond is zeroed for uncond.
@@ -60,10 +63,11 @@ def batched_flow_matching(
         z_u[:, latent_start:] = zp
         z_z = torch.cat([z_c, z_u], dim=0)      # [2n, total_len, fm_hidden]
         t_t = t.reshape(1).expand(2 * n).to(z_z.dtype)
-        vt = core.velocity_field_predictor(
-            x=z_z, timesteps=t_t, attn_mask=attn2, pos_ids=pos2, g_cond=g2,
-        )
-        vt = vt[:, latent_start:]               # [2n, patch, latent]
+        vt = vfp(x=z_z, timesteps=t_t, attn_mask=attn2, pos_ids=pos2, g_cond=g2)
+        # clone: under CUDA-graph (reduce-overhead) compile the output aliases a
+        # static buffer that the next ODE eval overwrites; the solver feeds vt
+        # back via z, so it must own its memory. Cheap (latent slice only).
+        vt = vt[:, latent_start:].clone()       # [2n, patch, latent]
         vt_c, vt_u = vt[:n], vt[n:]
         return vt_c + gs * (vt_c - vt_u)
 

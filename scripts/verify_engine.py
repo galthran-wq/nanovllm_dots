@@ -69,9 +69,14 @@ def main() -> None:
     torch.set_default_dtype(torch.float32)
 
     def make_engine():
+        # Golden regression runs the EAGER FM path so it stays bit-exact to the
+        # reference. The torch.compile FM is a faithful-but-not-bit-identical
+        # speedup (validated separately by verify_fm_compile.py, per-call), so it
+        # would legitimately diverge here via autoregressive amplification.
         return DotsBatchEngine(
             runtime, paged, model_dir=args.model,
             num_kvcache_blocks=128, block_size=256, max_num_seqs=16,
+            compile_fm=False,
         )
 
     all_pass = True

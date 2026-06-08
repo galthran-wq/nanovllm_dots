@@ -77,6 +77,10 @@ class DotsBatchEngine:
         block_size: int = 256,
         max_num_seqs: int = 32,
         max_model_len: int = 4096,
+        compile_fm: bool = True,
+        fm_vfp=None,
+        fm_len_bucket: int = 0,
+        fm_compile_mode: str = "default",
     ) -> None:
         self.runtime = runtime
         self.dots = runtime.model                 # DotsTtsModel: core/patch_encoder/FM/vocoder
@@ -84,6 +88,29 @@ class DotsBatchEngine:
         self.device = next(self.core.parameters()).device
         self.dtype = torch.bfloat16
         self.block_size = block_size
+
+        # FM is overhead-bound at single-stream (<1% MFU: tiny matrices, eager
+        # kernel launches), so compile the DiT forward (inductor fusion -> fewer,
+        # bigger kernels). History length is bucketed (mask/pos already pad
+        # correctly) so a bounded set of shapes is captured. `fm_vfp` lets a
+        # caller share ONE compiled wrapper across engines (stable graph cache).
+        # NOTE: mode="reduce-overhead" (CUDA graphs) corrupts results here -- the
+        # ODE solver feeds each vfp output back as the next input, and the graph
+        # reuses output memory. Use "default" until outputs are cloned/captured
+        # safely (separate step).
+        self.compile_fm = compile_fm
+        self.fm_len_bucket = fm_len_bucket
+        if fm_vfp is not None:
+            self._vfp = fm_vfp
+        elif compile_fm:
+            # dynamic=True => one graph handles every history length (no recompile,
+            # no length padding). Bucketing is only needed for CUDA-graph capture.
+            self._vfp = torch.compile(
+                self.core.velocity_field_predictor, mode=fm_compile_mode,
+                dynamic=(fm_len_bucket == 0),
+            )
+        else:
+            self._vfp = self.core.velocity_field_predictor
 
         self.batched_llm = BatchedPagedLLM(
             paged_llm, num_blocks=num_kvcache_blocks, block_size=block_size,
@@ -256,6 +283,12 @@ class DotsBatchEngine:
         core, dots = self.core, self.dots
         states = [p.gen_state for p in payloads]
         n = len(states)
+        max_len = max(st.fm_seq_len for st in states)
+        # Optional length bucketing (for CUDA-graph shape stability); adds padding
+        # and a bit of numerical drift, so off by default (dynamic compile instead).
+        if self.fm_len_bucket > 0:
+            b = self.fm_len_bucket
+            max_len = ((max_len + b - 1) // b) * b
         # One odeint call integrates the whole batch, so the ODE schedule and CFG
         # must be uniform across co-active requests. Fail loud rather than silently
         # decode some requests with the wrong NFE/guidance.
@@ -268,7 +301,6 @@ class DotsBatchEngine:
                     "batched FM requires uniform (num_steps, guidance_scale, ode_method) "
                     "across co-active requests; got mismatched decode params."
                 )
-        max_len = max(st.fm_seq_len for st in states)
         total_len = max_len + core.latent_patch_size
         H = core.fm_hidden_size
         dev, dt = self.device, self.dtype
@@ -294,7 +326,7 @@ class DotsBatchEngine:
         return batched_flow_matching(
             core, input_sequence=inp, cfg_sequence=cfg, attn_mask=mask, pos_ids=pos,
             g_cond=gcond, num_steps=p0.num_steps, guidance_scale=p0.guidance_scale,
-            ode_method=p0.ode_method,
+            ode_method=p0.ode_method, vfp=self._vfp,
         )
 
     def _finish_patch(self, seq: Sequence, st: DotsSeqState, patch: torch.Tensor, stop: bool) -> None:
