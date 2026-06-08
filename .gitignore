@@ -1,8 +1,9 @@
 # virtualenv
 .venv/
 
-# model weights (9.5GB, fetched via huggingface_hub)
-models/
+# model weights (9.5GB, fetched via huggingface_hub) -- anchored to repo root
+# so it does NOT match the nanovllm_dots/models/ package dir.
+/models/
 
 # golden reference audio/latents (regenerate via scripts/gen_golden.py); keep manifest
 golden/*.wav
