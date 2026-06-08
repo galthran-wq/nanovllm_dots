@@ -343,19 +343,20 @@ class DotsBatchEngine:
         work is O(1) in history length. Single-stream for now -- the active
         forwards run per request; cross-request batching is the next step.
         Returns [N, patch_size, latent_dim]."""
-        from nanovllm_dots.models.dots.cached_fm import CachedFMHead
+        from nanovllm_dots.models.dots.flash_cached_fm import FlashCachedFMHead
 
         core = self.core
         lp, ld = core.latent_patch_size, core.latent_dim
+        stride = core.hidden_patch_size + core.latent_patch_size
         outs = []
         for p in payloads:
             st = p.gen_state
             if p.ode_method != "euler":
                 raise RuntimeError("fm_accel='kvcache' supports ode_method='euler' only.")
             if p.fm_head is None:
-                p.fm_head = CachedFMHead(
+                p.fm_head = FlashCachedFMHead(
                     core, num_steps=p.num_steps, guidance_scale=p.guidance_scale,
-                    dit=self._vfp,
+                    max_patches=st.fm_capacity // stride + 1, dit=self._vfp,
                 )
             if p.g_cond is not None:
                 gcond = p.g_cond.to(self.device, self.dtype).reshape(1, -1)
