@@ -85,7 +85,9 @@ class DotsBatchEngine:
         fm_compile_mode: str = "default",
         fm_accel: str | None = None,   # "compile"|"cudagraph"|"kvcache"|"hybrid"|"none"
         kvcache_graphed: bool = True,  # CUDA-graph the kvcache FM head
-        hybrid_threshold: int = 800,   # fm_seq_len to switch cudagraph-full -> kvcache
+        hybrid_threshold: int = 400,   # fm_seq_len to switch cudagraph-full -> kvcache
+                                       # (~per-patch crossover; clean bench: kvcache
+                                       # already wins by L~250/16s, cudagraph by L~105/3.5s)
     ) -> None:
         self.kvcache_graphed = kvcache_graphed
         self.hybrid_threshold = hybrid_threshold
