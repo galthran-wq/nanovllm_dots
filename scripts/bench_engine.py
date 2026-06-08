@@ -36,9 +36,14 @@ def main() -> None:
     ap.add_argument("--concurrency", default="1,4,8")
     ap.add_argument("--num-steps", type=int, default=10)
     ap.add_argument("--guidance-scale", type=float, default=1.2)
+    ap.add_argument("--text-repeat", type=int, default=1, help="repeat text N times (longer audio)")
+    ap.add_argument("--no-eos", action="store_true",
+                    help="disable eos so every accel generates the SAME deterministic length")
+    ap.add_argument("--fixed-len", type=int, default=0,
+                    help="stop after exactly N patches (eos off) -> identical length all accels")
     ap.add_argument("--no-compile", action="store_true", help="disable FM torch.compile")
     ap.add_argument("--fm-accel", default=None,
-                    choices=["none", "compile", "cudagraph", "kvcache"],
+                    choices=["none", "compile", "cudagraph", "kvcache", "hybrid"],
                     help="FM acceleration (overrides --no-compile)")
     args = ap.parse_args()
     levels = [int(x) for x in args.concurrency.split(",")]
@@ -73,7 +78,9 @@ def main() -> None:
     if fm_accel == "compile":
         shared_vfp = torch.compile(runtime.model.core.velocity_field_predictor,
                                    mode="default", dynamic=False)
-    elif fm_accel == "cudagraph":
+    elif fm_accel in ("cudagraph", "hybrid"):
+        # hybrid shares the cudagraph-full runner so the bench's per-run_batch
+        # engine recreation doesn't re-capture the per-length graphs.
         from nanovllm_dots.models.dots.cudagraph_dit import CudaGraphRunner, make_dit_capture_safe
         make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
         shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
@@ -88,8 +95,13 @@ def main() -> None:
             fm_accel=fm_accel, fm_vfp=shared_vfp, fm_len_bucket=0,
         )
         texts = ([EN1, ZH1] * ((n + 1) // 2))[:n]
+        texts = [" ".join([t] * args.text_repeat) for t in texts]
+        eos_thr = 2.0 if (args.no_eos or args.fixed_len) else 0.8  # >1 never triggers
+        cap = args.fixed_len or None
         for i, t in enumerate(texts):
-            eng.add_request(f"r{i}", t, num_steps=args.num_steps, guidance_scale=args.guidance_scale)
+            eng.add_request(f"r{i}", t, num_steps=args.num_steps,
+                            guidance_scale=args.guidance_scale, eos_threshold=eos_thr,
+                            max_patches=cap)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         out = eng.run_all()

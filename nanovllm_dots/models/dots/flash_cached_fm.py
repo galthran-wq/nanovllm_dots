@@ -276,6 +276,42 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
             h = h + g_f * block.ffn(modulate(block.norm2(h), s_f, sc_f))
         return self._z_buf  # dummy output
 
+    @torch.no_grad()
+    def prime_to(self, state, g_cond) -> None:
+        """Bulk-extend the cache to cover the whole prefix [cached_P : fm_seq_len-1]
+        in ONE eager pass (arbitrary length, not graphed). Used to switch into the
+        cache mid-generation (the length-adaptive hybrid): cudagraph-full runs the
+        short-history patches, then we prime the cache once and decode_patch the
+        rest at O(1)/patch. O(L) one-time; subsequent extends are graphed stride."""
+        L = int(state.fm_seq_len)
+        if not self._c_built:
+            self._c_buf.copy_(self._build_conditions(g_cond))
+            self._c_built = True
+        if L - 1 <= self.cached_P:
+            return
+        seq, cfg = state.fm_sequence, state.fm_cfg_sequence
+        dev = self.device
+        ns, cap = self.num_steps, self.cache.cap
+        s, e = self.cached_P, L - 1
+        m, H = e - s, seq.size(-1)
+        rows2 = torch.cat([seq[:, s:e], cfg[:, s:e]], dim=0)              # [2, m, H]
+        rows = rows2.unsqueeze(0).expand(ns, -1, -1, -1).reshape(2 * ns, m, H)
+        pos = torch.arange(s, e, device=dev, dtype=torch.float32).reshape(1, -1).expand(2 * ns, -1)
+        seqlens = torch.full((2 * ns,), s, device=dev, dtype=torch.int32)
+        dit = self.dit
+        h = dit.input_layer(rows)
+        for l, block in enumerate(dit.blocks):
+            s_a, sc_a, g_a, s_f, sc_f, g_f = block_modulation(block, self._c_flat)
+            attn = block.attn
+            q, kk, vv = _project_qkv_flash(attn, modulate(block.norm1(h), s_a, sc_a), pos)
+            kb = self.cache.kbuf[l].reshape(2 * ns, cap, self.heads, self.head_dim)
+            vb = self.cache.vbuf[l].reshape(2 * ns, cap, self.heads, self.head_dim)
+            o = flash_attn_with_kvcache(q, kb, vb, k=kk, v=vv, cache_seqlens=seqlens, causal=True)
+            h = h + g_a * _o_proj_flash(attn, o)
+            h = h + g_f * block.ffn(modulate(block.norm2(h), s_f, sc_f))
+        self.cache.seqlens.fill_(e)
+        self.cached_P = e
+
     # -- overrides ----------------------------------------------------------
     @torch.no_grad()
     def extend_for_patch(self, state, g_cond) -> None:

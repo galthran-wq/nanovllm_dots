@@ -64,6 +64,7 @@ class DotsSeqState:
     guidance_scale: float = 1.2
     ode_method: str = "euler"
     eos_threshold: float = 0.8
+    max_patches: int | None = None    # hard cap on emitted patches (benchmarking)
     fm_head: Any = None               # per-seq CachedFMHead (fm_accel="kvcache")
 
 
@@ -82,10 +83,12 @@ class DotsBatchEngine:
         fm_vfp=None,
         fm_len_bucket: int = 0,
         fm_compile_mode: str = "default",
-        fm_accel: str | None = None,   # "compile" | "cudagraph" | "kvcache" | "none"
+        fm_accel: str | None = None,   # "compile"|"cudagraph"|"kvcache"|"hybrid"|"none"
         kvcache_graphed: bool = True,  # CUDA-graph the kvcache FM head
+        hybrid_threshold: int = 800,   # fm_seq_len to switch cudagraph-full -> kvcache
     ) -> None:
         self.kvcache_graphed = kvcache_graphed
+        self.hybrid_threshold = hybrid_threshold
         self.runtime = runtime
         self.dots = runtime.model                 # DotsTtsModel: core/patch_encoder/FM/vocoder
         self.core = self.dots.core
@@ -106,7 +109,19 @@ class DotsBatchEngine:
             fm_accel = "compile" if compile_fm else "none"
         self.fm_accel = fm_accel
         self.fm_len_bucket = fm_len_bucket
-        if fm_vfp is not None:
+        if fm_accel == "hybrid":
+            # Length-adaptive: cudagraph-full DiT for short history, KV cache once it
+            # exceeds hybrid_threshold. Needs BOTH a CudaGraphRunner (short path,
+            # shareable across engines via fm_vfp so it isn't re-captured) and the
+            # eager DiT (the kvcache heads capture their own layer graphs).
+            from nanovllm_dots.models.dots.cudagraph_dit import (
+                CudaGraphRunner, make_dit_capture_safe,
+            )
+            make_dit_capture_safe(self.core.velocity_field_predictor, self.device)
+            self._vfp_full = fm_vfp if fm_vfp is not None else CudaGraphRunner(
+                self.core.velocity_field_predictor)
+            self._vfp = self.core.velocity_field_predictor
+        elif fm_vfp is not None:
             self._vfp = fm_vfp
         elif fm_accel == "cudagraph":
             # Manual CUDA-graph capture of the EAGER DiT (faithful to eager: the
@@ -134,9 +149,8 @@ class DotsBatchEngine:
             )
         elif fm_accel == "kvcache":
             # Per-timestep prefix KV cache: O(P) instead of O(P^2). FM runs through
-            # per-seq CachedFMHead objects (built lazily in _kvcache_fm); the DiT
-            # forward is eager here (a fixed-shape active forward to cudagraph is a
-            # later step). self._vfp is the eager DiT the heads call.
+            # per-seq CachedFMHead objects (built lazily in _kvcache_fm) that capture
+            # their own graphs of the eager DiT layers. self._vfp is that eager DiT.
             self._vfp = self.core.velocity_field_predictor
         else:
             self._vfp = self.core.velocity_field_predictor
@@ -223,6 +237,7 @@ class DotsBatchEngine:
         num_steps: int = 10,
         guidance_scale: float = 1.2,
         eos_threshold: float = 0.8,
+        max_patches: int | None = None,
     ) -> None:
         inputs = self.runtime._prepare_inputs(
             text=text, prompt_audio_path=None, prompt_text=None,
@@ -267,6 +282,7 @@ class DotsBatchEngine:
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             eos_threshold=eos_threshold,
+            max_patches=max_patches,
         )
         # KV hash tokens = the actual prefill token ids (enables prefix caching
         # across requests with identical text prefixes).
@@ -339,11 +355,11 @@ class DotsBatchEngine:
                 self.scheduler.finish(seq)
         return seqs
 
-    def _kvcache_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
+    def _kvcache_fm(self, payloads: list[DotsSeqState], *, prime: bool = False) -> torch.Tensor:
         """Per-timestep KV-cache FM. Each request carries its own CachedFMHead
         (own cond/uncond prefix cache that grows with its history), so per-patch
-        work is O(1) in history length. Single-stream for now -- the active
-        forwards run per request; cross-request batching is the next step.
+        work is O(1) in history length. `prime=True` (hybrid) bulk-fills a head's
+        cache to the current length on first use (switching in mid-generation).
         Returns [N, patch_size, latent_dim]."""
         from nanovllm_dots.models.dots.flash_cached_fm import (
             FlashCachedFMHead, GraphedFlashCachedFMHead,
@@ -363,20 +379,49 @@ class DotsBatchEngine:
                     core, num_steps=p.num_steps, guidance_scale=p.guidance_scale,
                     max_patches=st.fm_capacity // stride + 1, dit=self._vfp,
                 )
-            if p.g_cond is not None:
-                gcond = p.g_cond.to(self.device, self.dtype).reshape(1, -1)
-            else:
-                gcond = st.fm_null_g_cond.to(self.device, self.dtype)
-            noise = torch.randn((1, lp, ld), device=self.device, dtype=self.dtype)
-            z = p.fm_head.decode_patch(st, noise, gcond)   # [1, lp, ld]
+                if prime:   # switching in mid-generation: build the prefix cache once
+                    p.fm_head.prime_to(st, self._seq_gcond(p))
+            z = p.fm_head.decode_patch(st, torch.randn(
+                (1, lp, ld), device=self.device, dtype=self.dtype), self._seq_gcond(p))
             outs.append(z[0])
         return torch.stack(outs, dim=0)                    # [N, lp, ld]
 
+    def _seq_gcond(self, p: DotsSeqState) -> torch.Tensor:
+        st = p.gen_state
+        if p.g_cond is not None:
+            return p.g_cond.to(self.device, self.dtype).reshape(1, -1)
+        return st.fm_null_g_cond.to(self.device, self.dtype)
+
+    def _hybrid_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
+        """Length-adaptive: cudagraph-full DiT while the FM history is short (it
+        wins, O(P²) hasn't bitten), then the O(1)/patch KV cache once history
+        exceeds `hybrid_threshold` (cudagraph-full degrades past realtime there).
+        Best of both across all audio lengths."""
+        thr = self.hybrid_threshold
+        results: list[torch.Tensor | None] = [None] * len(payloads)
+        short = [i for i, p in enumerate(payloads) if p.gen_state.fm_seq_len < thr]
+        long = [i for i, p in enumerate(payloads) if p.gen_state.fm_seq_len >= thr]
+        if short:
+            res = self._full_fm([payloads[i] for i in short], self._vfp_full)
+            for j, i in enumerate(short):
+                results[i] = res[j]
+        if long:
+            res = self._kvcache_fm([payloads[i] for i in long], prime=True)
+            for j, i in enumerate(long):
+                results[i] = res[j]
+        return torch.stack(results, dim=0)
+
     def _batched_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
-        """Pad every active sequence's FM history into one batch and integrate
-        the CFG ODE together. Returns [N, patch_size, latent_dim] (normalized)."""
+        """Dispatch the FM head per `fm_accel`. Returns [N, patch_size, latent_dim]."""
         if self.fm_accel == "kvcache":
             return self._kvcache_fm(payloads)
+        if self.fm_accel == "hybrid":
+            return self._hybrid_fm(payloads)
+        return self._full_fm(payloads, self._vfp)
+
+    def _full_fm(self, payloads: list[DotsSeqState], vfp) -> torch.Tensor:
+        """Pad every active sequence's FM history into one batch and integrate the
+        CFG ODE together through `vfp` (eager / compiled / cudagraph-full)."""
         from nanovllm_dots.models.dots.batched_fm import batched_flow_matching
 
         core, dots = self.core, self.dots
@@ -425,7 +470,7 @@ class DotsBatchEngine:
         return batched_flow_matching(
             core, input_sequence=inp, cfg_sequence=cfg, attn_mask=mask, pos_ids=pos,
             g_cond=gcond, num_steps=p0.num_steps, guidance_scale=p0.guidance_scale,
-            ode_method=p0.ode_method, vfp=self._vfp,
+            ode_method=p0.ode_method, vfp=vfp,
         )
 
     def _finish_patch(self, seq: Sequence, st: DotsSeqState, patch: torch.Tensor, stop: bool) -> None:
@@ -442,7 +487,8 @@ class DotsBatchEngine:
         seq.append_token(latent_cpu.reshape(-1).numpy().tobytes())
 
         schedule_exhausted = st.position >= st.schedule.size(1)
-        if stop or schedule_exhausted or st.patches_emitted >= st.span_count:
+        cap = st.span_count if st.max_patches is None else min(st.span_count, st.max_patches)
+        if stop or schedule_exhausted or st.patches_emitted >= cap:
             seq.stoped = True
 
     def _patch_to_embed(self, state, patch: torch.Tensor) -> torch.Tensor:
