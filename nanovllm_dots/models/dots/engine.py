@@ -415,6 +415,16 @@ class DotsBatchEngine:
 
     def _batched_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
         """Dispatch the FM head per `fm_accel`. Returns [N, patch_size, latent_dim]."""
+        if getattr(self.core, "mode", "flow_matching") == "meanflow":
+            # MeanFlow (dots.tts-mf): single-branch + duration embedding. The
+            # per-timestep KV cache encodes the CFG pair in its layer math, so it
+            # isn't wired for meanflow yet -> use the batched full path.
+            if self.fm_accel in ("kvcache", "hybrid"):
+                raise RuntimeError(
+                    f"fm_accel={self.fm_accel!r} not yet supported for MeanFlow "
+                    "(dots.tts-mf); use 'none', 'compile', or 'cudagraph'."
+                )
+            return self._full_fm(payloads, self._vfp)
         if self.fm_accel == "kvcache":
             return self._kvcache_fm(payloads)
         if self.fm_accel == "hybrid":
@@ -424,7 +434,10 @@ class DotsBatchEngine:
     def _full_fm(self, payloads: list[DotsSeqState], vfp) -> torch.Tensor:
         """Pad every active sequence's FM history into one batch and integrate the
         CFG ODE together through `vfp` (eager / compiled / cudagraph-full)."""
-        from nanovllm_dots.models.dots.batched_fm import batched_flow_matching
+        from nanovllm_dots.models.dots.batched_fm import (
+            batched_flow_matching, batched_meanflow,
+        )
+        meanflow = getattr(self.core, "mode", "flow_matching") == "meanflow"
 
         core, dots = self.core, self.dots
         states = [p.gen_state for p in payloads]
@@ -439,27 +452,34 @@ class DotsBatchEngine:
         # must be uniform across co-active requests. Fail loud rather than silently
         # decode some requests with the wrong NFE/guidance.
         p0 = payloads[0]
+        # MeanFlow has no CFG; only the step count must be uniform across the
+        # co-active batch. Flow-matching additionally pins guidance/ode_method.
         for p in payloads:
-            if (p.num_steps, p.guidance_scale, p.ode_method) != (
-                p0.num_steps, p0.guidance_scale, p0.ode_method
-            ):
+            mism = (p.num_steps != p0.num_steps) if meanflow else (
+                (p.num_steps, p.guidance_scale, p.ode_method)
+                != (p0.num_steps, p0.guidance_scale, p0.ode_method)
+            )
+            if mism:
                 raise RuntimeError(
-                    "batched FM requires uniform (num_steps, guidance_scale, ode_method) "
-                    "across co-active requests; got mismatched decode params."
+                    "batched FM requires uniform decode params (num_steps"
+                    + ("" if meanflow else ", guidance_scale, ode_method")
+                    + ") across co-active requests; got mismatched decode params."
                 )
         total_len = max_len + core.latent_patch_size
         H = core.fm_hidden_size
         dev, dt = self.device, self.dtype
 
         inp = torch.zeros(n, total_len, H, device=dev, dtype=dt)
-        cfg = torch.zeros(n, total_len, H, device=dev, dtype=dt)
+        # MeanFlow has no CFG branch, so the uncond (cfg) sequence is never used.
+        cfg = None if meanflow else torch.zeros(n, total_len, H, device=dev, dtype=dt)
         mask = torch.zeros(n, total_len, total_len, dtype=torch.bool, device=dev)
         pos = torch.zeros(n, total_len, dtype=torch.float32, device=dev)
         gcond = torch.zeros(n, H, device=dev, dtype=dt)
         for i, (st, p) in enumerate(zip(states, payloads)):
             L = st.fm_seq_len
             inp[i, :L] = st.fm_sequence[0, :L]
-            cfg[i, :L] = st.fm_cfg_sequence[0, :L]
+            if not meanflow:
+                cfg[i, :L] = st.fm_cfg_sequence[0, :L]
             # _build_fm_* fill a [1, total_len, ...] view in place (zero + structure);
             # padding gap [L:max_len] is self-masked, positions stay per-seq correct.
             dots._build_fm_attn_mask(state=st, attn_mask=mask[i : i + 1])
@@ -469,6 +489,13 @@ class DotsBatchEngine:
             elif st.fm_null_g_cond is not None:
                 gcond[i] = st.fm_null_g_cond[0]
 
+        if meanflow:
+            # guidance_scale / ode_method are intentionally dropped: MeanFlow
+            # distills CFG in and uses a fixed explicit-Euler few-step integrator.
+            return batched_meanflow(
+                core, input_sequence=inp, attn_mask=mask, pos_ids=pos,
+                g_cond=gcond, num_steps=p0.num_steps, vfp=vfp,
+            )
         return batched_flow_matching(
             core, input_sequence=inp, cfg_sequence=cfg, attn_mask=mask, pos_ids=pos,
             g_cond=gcond, num_steps=p0.num_steps, guidance_scale=p0.guidance_scale,

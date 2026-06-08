@@ -8,6 +8,8 @@
 # golden reference audio/latents (regenerate via scripts/gen_golden.py); keep manifest
 golden/*.wav
 golden/*.npy
+golden_mf/*.wav
+golden_mf/*.npy
 
 # vendored upstream reference (clone of github.com/rednote-hilab/dots.tts)
 reference/

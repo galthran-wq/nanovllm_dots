@@ -1,0 +1,39 @@
+{
+  "model": "models/dots.tts-mf",
+  "precision": "bfloat16",
+  "num_steps": 4,
+  "guidance_scale": 1.2,
+  "max_generate_length": 256,
+  "seed": 1234,
+  "sample_rate": 48000,
+  "items": [
+    {
+      "name": "en1",
+      "text": "Hello, this is a reference sample generated for regression testing.",
+      "wav": "en1.wav",
+      "latents": "en1.latents.npy",
+      "latent_shape": [
+        1,
+        100,
+        128
+      ],
+      "audio_samples": 192000,
+      "rtf": 0.8544793725013733,
+      "time_used": 3.417917490005493
+    },
+    {
+      "name": "zh1",
+      "text": "这是一个用于回归测试的参考样本。",
+      "wav": "zh1.wav",
+      "latents": "zh1.latents.npy",
+      "latent_shape": [
+        1,
+        80,
+        128
+      ],
+      "audio_samples": 153600,
+      "rtf": 0.8361013978719711,
+      "time_used": 2.6755244731903076
+    }
+  ]
+}

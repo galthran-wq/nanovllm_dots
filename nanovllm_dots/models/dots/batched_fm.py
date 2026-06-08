@@ -77,3 +77,50 @@ def batched_flow_matching(
     options = {"step_size": 1.0 / num_steps} if ode_method in ("euler", "midpoint", "rk4") else {}
     traj = odeint(solver, noise, times, atol=1e-5, rtol=1e-5, method=ode_method, options=options)
     return traj[-1]                             # [n, patch, latent]
+
+
+@torch.no_grad()
+def batched_meanflow(
+    core,
+    *,
+    input_sequence: torch.Tensor,   # [N, total_len, fm_hidden] (latent slot zeroed)
+    attn_mask: torch.Tensor,        # [N, total_len, total_len] bool
+    pos_ids: torch.Tensor,          # [N, total_len] float
+    g_cond: torch.Tensor,           # [N, fm_hidden]
+    num_steps: int = 4,
+    noise: torch.Tensor | None = None,
+    vfp=None,
+) -> torch.Tensor:
+    """Batched MeanFlow sampler for N requests -> [N, patch, latent].
+
+    Mirrors the reference `_meanflow_step_fm` / `meanflow_solver_step`: NO CFG
+    (the guidance is distilled in, single branch), the DiT additionally consumes
+    `duration=dt` via its duration embedder, and the integrator is an explicit
+    few-step `z += v*dt` over a uniform [0,1] grid (nfe = num_steps, ~4). Same
+    padded-batch layout as `batched_flow_matching` so N=1 reproduces the serial
+    reference path under matched noise.
+    """
+    n = input_sequence.size(0)
+    patch_size = core.latent_patch_size
+    latent_start = input_sequence.size(1) - patch_size
+    device, dtype = input_sequence.device, input_sequence.dtype
+    if vfp is None:
+        vfp = core.velocity_field_predictor
+
+    if noise is None:
+        noise = torch.randn((n, patch_size, core.latent_dim), device=device, dtype=dtype)
+    z = noise
+    times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
+    for step in range(num_steps):
+        t = times[step].expand(n).to(dtype)
+        dt = (times[step + 1] - times[step]).expand(n).to(dtype)
+        zp = core.coordinate_proj(z)            # [n, patch, fm_hidden]
+        z_c = input_sequence.clone()
+        z_c[:, latent_start:] = zp
+        vt = vfp(x=z_c, timesteps=t, duration=dt,
+                 attn_mask=attn_mask, pos_ids=pos_ids, g_cond=g_cond)
+        # clone: a cudagraph/compiled vfp aliases a static output buffer that the
+        # next step overwrites; z feeds back, so it must own its memory.
+        vt = vt[:, latent_start:].clone()       # [n, patch, latent]
+        z = z + vt * dt.view(-1, 1, 1)
+    return z                                    # [n, patch, latent]

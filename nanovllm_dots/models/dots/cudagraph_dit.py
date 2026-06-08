@@ -29,16 +29,14 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-def make_dit_capture_safe(dit, device: torch.device) -> None:
-    """Remove the one non-capturable op from the DiT timestep embedder.
+def _make_embedder_capture_safe(te, device: torch.device) -> None:
+    """Shadow one `TimestepEmbedder.timestep_embedding` with a capture-safe closure.
 
-    `TimestepEmbedder.timestep_embedding` builds `torch.arange(...).to(device)`
-    every call -- an H2D copy from pageable CPU memory, which aborts CUDA-graph
-    capture (and makes torch.compile reduce-overhead silently wrong). The freqs
-    are constant, so precompute them on-device once and shadow the staticmethod
-    with a capture-safe closure. Mathematically identical to the reference.
+    It builds `torch.arange(...).to(device)` every call -- an H2D copy from
+    pageable CPU memory, which aborts CUDA-graph capture (and makes torch.compile
+    reduce-overhead silently wrong). The freqs are constant, so precompute them
+    on-device once. Mathematically identical to the reference.
     """
-    te = dit.time_embedder
     dim = te.frequency_embedding_size
     half = dim // 2
     freqs = torch.exp(
@@ -55,6 +53,19 @@ def make_dit_capture_safe(dit, device: torch.device) -> None:
     te.timestep_embedding = timestep_embedding  # instance attr shadows the staticmethod
 
 
+def make_dit_capture_safe(dit, device: torch.device) -> None:
+    """Make the DiT timestep embedder(s) CUDA-graph capturable.
+
+    Patches `time_embedder` and, for the MeanFlow DiT (dots.tts-mf), also
+    `duration_embedder` -- both are TimestepEmbedders with the same arange().to()
+    capture hazard.
+    """
+    _make_embedder_capture_safe(dit.time_embedder, device)
+    dur = getattr(dit, "duration_embedder", None)
+    if dur is not None:
+        _make_embedder_capture_safe(dur, device)
+
+
 class CudaGraphRunner:
     def __init__(self, fn, *, warmup: int = 3):
         self.fn = fn                       # eager DiT forward (velocity_field_predictor)
@@ -62,27 +73,30 @@ class CudaGraphRunner:
         self._graphs: dict[tuple, dict] = {}
 
     @torch.no_grad()
-    def __call__(self, *, x, timesteps, attn_mask, pos_ids, g_cond):
+    def __call__(self, *, x, timesteps, attn_mask, pos_ids, g_cond, duration=None):
         key = (x.shape[0], x.shape[1])     # (2N, total_len)
         g = self._graphs.get(key)
         if g is None:
-            g = self._capture(x, timesteps, attn_mask, pos_ids, g_cond)
+            g = self._capture(x, timesteps, attn_mask, pos_ids, g_cond, duration)
             self._graphs[key] = g
         g["x"].copy_(x)
         g["t"].copy_(timesteps)
         g["mask"].copy_(attn_mask)
         g["pos"].copy_(pos_ids)
         g["g"].copy_(g_cond)
+        if duration is not None:               # MeanFlow: duration embedding input
+            g["dur"].copy_(duration)
         g["graph"].replay()
         return g["out"]
 
-    def _capture(self, x, timesteps, attn_mask, pos_ids, g_cond) -> dict:
+    def _capture(self, x, timesteps, attn_mask, pos_ids, g_cond, duration=None) -> dict:
         # static input buffers (stable addresses the graph reads from)
         sx = x.clone()
         st = timesteps.clone()
         smask = attn_mask.clone()
         spos = pos_ids.clone()
         sg = g_cond.clone()
+        sdur = duration.clone() if duration is not None else None
 
         # Force a single mask-agnostic SDPA backend. Otherwise SDPA picks its
         # kernel from the capture-time mask sparsity and bakes it into the graph,
@@ -91,6 +105,9 @@ class CudaGraphRunner:
         # additive masks and is value-agnostic.
         def call():
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                if sdur is not None:
+                    return self.fn(x=sx, timesteps=st, duration=sdur,
+                                   attn_mask=smask, pos_ids=spos, g_cond=sg)
                 return self.fn(x=sx, timesteps=st, attn_mask=smask, pos_ids=spos, g_cond=sg)
 
         # Capturing while other GPU work is in flight corrupts the graph, so drain
@@ -110,4 +127,7 @@ class CudaGraphRunner:
         with torch.cuda.graph(graph):
             out = call()
         torch.cuda.synchronize()
-        return {"x": sx, "t": st, "mask": smask, "pos": spos, "g": sg, "out": out, "graph": graph}
+        rec = {"x": sx, "t": st, "mask": smask, "pos": spos, "g": sg, "out": out, "graph": graph}
+        if sdur is not None:
+            rec["dur"] = sdur
+        return rec
