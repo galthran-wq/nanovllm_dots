@@ -162,7 +162,7 @@ class FlashCachedFMHead:
 
     @torch.no_grad()
     def velocity(self, z, k_index: int) -> torch.Tensor:
-        """One CFG ODE eval at timestep k -> [B, lp, latent_dim] (B == z batch)."""
+        """One CFG ODE eval at timestep k -> [1, lp, latent_dim]."""
         core = self.core
         zp = core.coordinate_proj(z)                    # [1, lp, H] (single stream)
         # active rows for both branches: [2, a, H]
@@ -182,4 +182,113 @@ class FlashCachedFMHead:
         z = noise.clone()
         for k in range(self.num_steps):
             z = z + self._dts[k] * self.velocity(z, k)
+        return z
+
+
+class GraphedFlashCachedFMHead(FlashCachedFMHead):
+    """CUDA-graphed FlashCachedFMHead. Captures the fixed-shape [2, 5] active and
+    extend layer-passes once (per ODE timestep) and replays them; only the device
+    `cache_seqlens` (the prefix length) varies across patches, so a single graph
+    per timestep serves every history length (the LLM-decode pattern). Collapses
+    the ~360 eager layer-iters/patch into ~20 graph replays.
+
+    All per-patch-varying inputs live in preallocated STATIC buffers (z, hid, pos,
+    conditions, seqlens) that the captured graphs read from; each call copies the
+    new values in place then replays. Falls back to eager for the (Phase-1: never)
+    case where a patch's extend isn't exactly `stride` rows.
+    """
+
+    def __init__(self, core, *, num_steps, guidance_scale, max_patches, dit=None,
+                 warmup: int = 3):
+        super().__init__(core, num_steps=num_steps, guidance_scale=guidance_scale,
+                         max_patches=max_patches, dit=dit)
+        H = core.fm_hidden_size
+        a = self.hp + self.lp
+        dev, dt = self.device, self.dtype
+        z = lambda *s, d=dt: torch.zeros(*s, device=dev, dtype=d)
+        # static input buffers (fixed addresses the graphs read)
+        self._z_buf = z(1, self.lp, self.latent_dim)
+        self._hid_buf = z(2, self.hp, H)
+        self._rows_buf = z(2, self.stride, H)
+        self._pos_act_buf = z(2, a, d=torch.float32)
+        self._pos_ext_buf = z(2, self.stride, d=torch.float32)
+        self._c_buf = z(num_steps, 2, self.dit.blocks[0].adaLN_modulation[-1].in_features)
+        self._dts_dev = self._dts
+        self._gs = torch.tensor(self.guidance_scale, device=dev, dtype=dt)  # static (no in-capture H2D)
+        self.warmup = warmup
+        self._g_active: dict[int, dict] = {}   # k -> captured active graph
+        self._g_extend: dict[int, dict] = {}   # k -> captured extend graph
+
+    # -- capture helpers ----------------------------------------------------
+    def _capture(self, fn):
+        torch.cuda.synchronize()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(self.warmup):
+                fn()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn()
+        torch.cuda.synchronize()
+        return graph, out
+
+    def _active_fn(self, k):
+        core = self.core
+        zp = core.coordinate_proj(self._z_buf)
+        h = torch.cat([
+            torch.cat([self._hid_buf[0:1], zp], dim=1),
+            torch.cat([self._hid_buf[1:2], zp], dim=1),
+        ], dim=0)
+        out = self._layer_pass(k, h, self._pos_act_buf, self._c_buf[k], causal=False)
+        vel = final_velocity(self.dit, out, self._c_buf[k])[:, self.hp :]
+        return vel[0:1] + self._gs * (vel[0:1] - vel[1:2])
+
+    def _extend_fn(self, k):
+        self._layer_pass(k, self._rows_buf, self._pos_ext_buf, self._c_buf[k], causal=True)
+        return self._z_buf  # dummy output (extend is a side-effecting write to cache)
+
+    # -- overrides ----------------------------------------------------------
+    @torch.no_grad()
+    def extend_for_patch(self, state, g_cond) -> None:
+        L = int(state.fm_seq_len)
+        seq, cfg = state.fm_sequence, state.fm_cfg_sequence
+        dev = self.device
+        a = self.hp + self.lp
+        self._c_buf.copy_(self._build_conditions(g_cond))
+
+        if L - 1 > self.cached_P:
+            s, e = self.cached_P, L - 1
+            m = e - s
+            if m != self.stride:
+                raise RuntimeError(
+                    f"graphed extend expects stride={self.stride} rows, got {m}.")
+            self._rows_buf.copy_(torch.cat([seq[:, s:e], cfg[:, s:e]], dim=0))
+            self._pos_ext_buf.copy_(
+                torch.arange(s, e, device=dev, dtype=torch.float32).reshape(1, -1).expand(2, -1))
+            for k in range(self.num_steps):
+                if k not in self._g_extend:
+                    graph, _ = self._capture(lambda k=k: self._extend_fn(k))
+                    self._g_extend[k] = {"graph": graph}
+                self._g_extend[k]["graph"].replay()   # capture records only; execute now
+            self.cache.seqlens += m
+            self.cached_P = e
+
+        self._hid_buf.copy_(torch.cat([seq[:, L - 1 : L], cfg[:, L - 1 : L]], dim=0))
+        self._pos_act_buf.copy_(
+            torch.arange(L - 1, L - 1 + a, device=dev, dtype=torch.float32).reshape(1, -1).expand(2, -1))
+
+    @torch.no_grad()
+    def decode_patch(self, state, noise, g_cond) -> torch.Tensor:
+        self.extend_for_patch(state, g_cond)
+        z = noise.clone()
+        for k in range(self.num_steps):
+            self._z_buf.copy_(z)
+            if k not in self._g_active:
+                graph, out = self._capture(lambda k=k: self._active_fn(k))
+                self._g_active[k] = {"graph": graph, "out": out}
+            self._g_active[k]["graph"].replay()       # capture records only; execute now
+            z = z + self._dts_dev[k] * self._g_active[k]["out"]
         return z

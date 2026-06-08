@@ -82,8 +82,10 @@ class DotsBatchEngine:
         fm_vfp=None,
         fm_len_bucket: int = 0,
         fm_compile_mode: str = "default",
-        fm_accel: str | None = None,   # "compile" | "cudagraph" | "none"
+        fm_accel: str | None = None,   # "compile" | "cudagraph" | "kvcache" | "none"
+        kvcache_graphed: bool = True,  # CUDA-graph the kvcache FM head
     ) -> None:
+        self.kvcache_graphed = kvcache_graphed
         self.runtime = runtime
         self.dots = runtime.model                 # DotsTtsModel: core/patch_encoder/FM/vocoder
         self.core = self.dots.core
@@ -343,7 +345,10 @@ class DotsBatchEngine:
         work is O(1) in history length. Single-stream for now -- the active
         forwards run per request; cross-request batching is the next step.
         Returns [N, patch_size, latent_dim]."""
-        from nanovllm_dots.models.dots.flash_cached_fm import FlashCachedFMHead
+        from nanovllm_dots.models.dots.flash_cached_fm import (
+            FlashCachedFMHead, GraphedFlashCachedFMHead,
+        )
+        HeadCls = GraphedFlashCachedFMHead if self.kvcache_graphed else FlashCachedFMHead
 
         core = self.core
         lp, ld = core.latent_patch_size, core.latent_dim
@@ -354,7 +359,7 @@ class DotsBatchEngine:
             if p.ode_method != "euler":
                 raise RuntimeError("fm_accel='kvcache' supports ode_method='euler' only.")
             if p.fm_head is None:
-                p.fm_head = FlashCachedFMHead(
+                p.fm_head = HeadCls(
                     core, num_steps=p.num_steps, guidance_scale=p.guidance_scale,
                     max_patches=st.fm_capacity // stride + 1, dit=self._vfp,
                 )
