@@ -55,7 +55,10 @@ def _o_proj_flash(attn, o):
 class FlashFMCache:
     """Preallocated per-(timestep, layer) prefix K/V for the 2 CFG branches.
 
-    kbuf/vbuf: [num_steps, num_layers, 2, cap, heads, dim]; row 0 = cond, 1 = uncond.
+    kbuf/vbuf: [num_layers, num_steps, 2, cap, heads, dim]; row 0 = cond, 1 = uncond.
+    Layout is layer-major so a per-layer slice kbuf[l] = [steps, 2, cap, ...] is
+    contiguous and reshapes to [steps*2, cap, ...] for the batched-over-timesteps
+    extend (one flash call for all ODE timesteps).
     seqlens:   [2] int32, the shared prefix length (all timesteps/layers grow in
     lockstep, one patch = +stride). `cap` must hold max prefix + the 5 active
     scratch slots.
@@ -65,7 +68,7 @@ class FlashFMCache:
         self.num_steps = num_steps
         self.num_layers = num_layers
         self.cap = cap
-        z = lambda: torch.zeros(num_steps, num_layers, 2, cap, heads, dim,
+        z = lambda: torch.zeros(num_layers, num_steps, 2, cap, heads, dim,
                                 device=device, dtype=dtype)
         self.kbuf = z()
         self.vbuf = z()
@@ -153,7 +156,7 @@ class FlashCachedFMHead:
             attn = block.attn
             q, kk, vv = _project_qkv_flash(attn, modulate(block.norm1(h), s_a, sc_a), pos)
             o = flash_attn_with_kvcache(
-                q, cache.kbuf[k_index, l], cache.vbuf[k_index, l],
+                q, cache.kbuf[l, k_index], cache.vbuf[l, k_index],
                 k=kk, v=vv, cache_seqlens=cache.seqlens, causal=causal,
             )
             h = h + g_a * _o_proj_flash(attn, o)
@@ -206,18 +209,24 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
         a = self.hp + self.lp
         dev, dt = self.device, self.dtype
         z = lambda *s, d=dt: torch.zeros(*s, device=dev, dtype=d)
+        ns = num_steps
+        model_dim = self.dit.blocks[0].adaLN_modulation[-1].in_features
         # static input buffers (fixed addresses the graphs read)
         self._z_buf = z(1, self.lp, self.latent_dim)
         self._hid_buf = z(2, self.hp, H)
-        self._rows_buf = z(2, self.stride, H)
         self._pos_act_buf = z(2, a, d=torch.float32)
-        self._pos_ext_buf = z(2, self.stride, d=torch.float32)
-        self._c_buf = z(num_steps, 2, self.dit.blocks[0].adaLN_modulation[-1].in_features)
+        self._c_buf = z(ns, 2, model_dim)
+        # batched extend over all ODE timesteps: 2*ns rows = (timestep, branch)
+        self._rows_ext_buf = z(2 * ns, self.stride, H)
+        self._pos_ext_all = z(2 * ns, self.stride, d=torch.float32)
+        self._seqlens_ext = torch.zeros(2 * ns, device=dev, dtype=torch.int32)
+        self._c_flat = self._c_buf.view(2 * ns, model_dim)   # view (extend reads all timesteps)
         self._dts_dev = self._dts
         self._gs = torch.tensor(self.guidance_scale, device=dev, dtype=dt)  # static (no in-capture H2D)
+        self._c_built = False  # c_k = time_embedder(t_k)+g_cond is constant/stream -> build once
         self.warmup = warmup
         self._g_active: dict[int, dict] = {}   # k -> captured active graph
-        self._g_extend: dict[int, dict] = {}   # k -> captured extend graph
+        self._g_extend_all: dict | None = None  # one graph: extend all timesteps
 
     # -- capture helpers ----------------------------------------------------
     def _capture(self, fn):
@@ -246,9 +255,26 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
         vel = final_velocity(self.dit, out, self._c_buf[k])[:, self.hp :]
         return vel[0:1] + self._gs * (vel[0:1] - vel[1:2])
 
-    def _extend_fn(self, k):
-        self._layer_pass(k, self._rows_buf, self._pos_ext_buf, self._c_buf[k], causal=True)
-        return self._z_buf  # dummy output (extend is a side-effecting write to cache)
+    def _extend_all_fn(self):
+        """Batched extend over ALL ODE timesteps in one pass: 2*ns rows (timestep,
+        branch) through the layers, each layer one flash call over the cache viewed
+        as [2*ns, cap, h, d]. The new prefix rows are the same for every timestep
+        (only the modulation c[k] differs), so this is 18 layer-passes/patch
+        instead of ns*18. Side-effecting cache write (causal, persist)."""
+        dit, cache = self.dit, self.cache
+        ns, cap = self.num_steps, self.cache.cap
+        h = dit.input_layer(self._rows_ext_buf)              # [2ns, stride, model_dim]
+        for l, block in enumerate(dit.blocks):
+            s_a, sc_a, g_a, s_f, sc_f, g_f = block_modulation(block, self._c_flat)
+            attn = block.attn
+            q, kk, vv = _project_qkv_flash(attn, modulate(block.norm1(h), s_a, sc_a), self._pos_ext_all)
+            kb = cache.kbuf[l].reshape(2 * ns, cap, self.heads, self.head_dim)
+            vb = cache.vbuf[l].reshape(2 * ns, cap, self.heads, self.head_dim)
+            o = flash_attn_with_kvcache(q, kb, vb, k=kk, v=vv,
+                                        cache_seqlens=self._seqlens_ext, causal=True)
+            h = h + g_a * _o_proj_flash(attn, o)
+            h = h + g_f * block.ffn(modulate(block.norm2(h), s_f, sc_f))
+        return self._z_buf  # dummy output
 
     # -- overrides ----------------------------------------------------------
     @torch.no_grad()
@@ -257,7 +283,9 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
         seq, cfg = state.fm_sequence, state.fm_cfg_sequence
         dev = self.device
         a = self.hp + self.lp
-        self._c_buf.copy_(self._build_conditions(g_cond))
+        if not self._c_built:   # constant across patches for a stream; build once
+            self._c_buf.copy_(self._build_conditions(g_cond))
+            self._c_built = True
 
         if L - 1 > self.cached_P:
             s, e = self.cached_P, L - 1
@@ -265,15 +293,17 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
             if m != self.stride:
                 raise RuntimeError(
                     f"graphed extend expects stride={self.stride} rows, got {m}.")
-            self._rows_buf.copy_(torch.cat([seq[:, s:e], cfg[:, s:e]], dim=0))
-            self._pos_ext_buf.copy_(
-                torch.arange(s, e, device=dev, dtype=torch.float32).reshape(1, -1).expand(2, -1))
-            for k in range(self.num_steps):
-                if k not in self._g_extend:
-                    graph, _ = self._capture(lambda k=k: self._extend_fn(k))
-                    self._g_extend[k] = {"graph": graph}
-                self._g_extend[k]["graph"].replay()   # capture records only; execute now
-            self.cache.seqlens += m
+            ns, H = self.num_steps, seq.size(-1)
+            rows2 = torch.cat([seq[:, s:e], cfg[:, s:e]], dim=0)          # [2, stride, H]
+            self._rows_ext_buf.view(ns, 2, self.stride, H).copy_(rows2.unsqueeze(0))
+            pos_ext = torch.arange(s, e, device=dev, dtype=torch.float32)
+            self._pos_ext_all.view(ns, 2, self.stride).copy_(pos_ext.view(1, 1, self.stride))
+            self._seqlens_ext.fill_(s)                                    # write prefix at P_old
+            if self._g_extend_all is None:
+                graph, _ = self._capture(self._extend_all_fn)
+                self._g_extend_all = {"graph": graph}
+            self._g_extend_all["graph"].replay()                         # capture records only; execute now
+            self.cache.seqlens.fill_(e)                                   # active reads P_new
             self.cached_P = e
 
         self._hid_buf.copy_(torch.cat([seq[:, L - 1 : L], cfg[:, L - 1 : L]], dim=0))
