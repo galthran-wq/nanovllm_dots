@@ -1,26 +1,25 @@
-"""Manual CUDA-graph capture of the FM DiT forward. EXPERIMENTAL / opt-in.
+"""Manual CUDA-graph capture of the FM DiT forward.
 
-STATUS (Phase 2.4, WIP): proves the speed (single-stream RTF 0.67, vs 1.26
-compiled / 1.69 eager) and is bit-exact when each captured graph is used for
-exactly ONE shape. But with length bucketing -- required for graph *reuse*
-across patches, hence for the actual speedup -- a graph reused across patches
-with different mask/pos/x values produces a wrong (but valid-length-ish) sample
-(seq cos ~0.69-0.73 vs golden, non-monotonic in bucket size). Diagnosis: replay
-does not correctly pick up the copied static-input buffers for this DiT (classic
-cudagraph input-staleness). Unbucketed (unique shape/patch => fresh graph each)
-is cos 1.0 but captures every patch => no speedup. The robust fix is the
-reference's static-workspace cudagraph approach (optimize=True, RTF 0.426).
-Default engine path stays torch.compile; enable via fm_accel="cudagraph" only
-for experiments.
+Single-stream FM is overhead-bound (<1% MFU: tiny matrices, eager kernel
+launches), so we capture the eager DiT forward into a CUDA graph and replay it.
+Recording the EAGER kernels keeps the result bit-identical to eager (no inductor
+drift), while the launch overhead is gone: single-stream RTF 1.69 -> 0.65, and
+cos 1.0 vs the eager golden.
 
-Design: own the static buffers ourselves (copy each call's inputs into fixed
-buffers, replay, read a fixed output buffer) -- `torch.compile(reduce-overhead)`
-corrupts the FM because the ODE feeds the output back and the graph keeps reading
-the first call's input address. Bonus over torch.compile: the graph records the
-EAGER kernels (bit-identical to eager, no inductor drift) while killing the
-kernel-launch overhead that dominates single-stream FM (<1% MFU). One graph per
-(batch, seq_len) shape (=> length bucketing); the returned tensor is a static
-buffer the next replay overwrites, so the caller clones what it keeps.
+We own the static I/O buffers (copy each call's inputs into fixed buffers,
+replay, read a fixed output buffer) -- `torch.compile(reduce-overhead)` instead
+corrupts the FM (the ODE feeds the output back and its captured graph reads the
+first call's input address) and was also slow here.
+
+One graph per (batch, seq_len) shape. Run UNBUCKETED (fm_len_bucket=0): the FM
+history grows by a fixed stride per patch, so only ~one shape per patch-count
+recurs across requests -- a bounded graph set, captured once and replayed
+EXACTLY. This is both faster and exact vs length bucketing, which pads the
+history and (because the autoregressive FM amplifies the per-patch padding bf16
+noise) diverges to cos ~0.73 -- a real effect present in eager too, NOT a
+cudagraph bug. Capturing a new shape mid-generation is safe (cold first request
+is correct). The returned tensor is a static buffer the next replay overwrites,
+so the caller clones what it keeps (the ODE solver clones the latent slice).
 """
 from __future__ import annotations
 

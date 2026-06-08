@@ -109,6 +109,26 @@ def main() -> None:
     else:
         print(f"[verify_engine] single: no paged-golden at {gpath} (run verify_e2e --save-paged-golden); skipping")
 
+    # --- Test 1b: cudagraph FM path is EXACT (unbucketed records eager kernels) ---
+    if os.path.exists(gpath):
+        golden = torch.from_numpy(np.load(gpath)).float()
+        set_seed(args.seed)
+        eng = DotsBatchEngine(
+            runtime, paged, model_dir=args.model,
+            num_kvcache_blocks=128, block_size=256, max_num_seqs=16,
+            fm_accel="cudagraph",  # unbucketed by default => bit-exact to eager
+        )
+        eng.add_request("en1", EN1, num_steps=args.num_steps, guidance_scale=args.guidance_scale)
+        cg = eng.run_all()["en1"]
+        n = min(cg.size(1), golden.size(1))
+        cgcos = torch.nn.functional.cosine_similarity(
+            cg[:, :n].reshape(-1, cg.size(-1)), golden[:, :n].reshape(-1, golden.size(-1)), dim=-1
+        ).mean().item() if n > 0 else 0.0
+        ok = cg.size(1) == golden.size(1) and cgcos > 0.999
+        all_pass = all_pass and ok
+        print(f"[verify_engine] cudagraph: out={list(cg.shape)} cos={cgcos:.4f} "
+              f"(cold, no warmup) {'PASS' if ok else 'FAIL'}")
+
     # --- Test 2: 8 parallel requests via continuous batching ---
     set_seed(args.seed)
     eng = make_engine()

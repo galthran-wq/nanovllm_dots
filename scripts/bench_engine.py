@@ -37,6 +37,8 @@ def main() -> None:
     ap.add_argument("--num-steps", type=int, default=10)
     ap.add_argument("--guidance-scale", type=float, default=1.2)
     ap.add_argument("--no-compile", action="store_true", help="disable FM torch.compile")
+    ap.add_argument("--fm-accel", default=None, choices=["none", "compile", "cudagraph"],
+                    help="FM acceleration (overrides --no-compile)")
     args = ap.parse_args()
     levels = [int(x) for x in args.concurrency.split(",")]
 
@@ -64,20 +66,24 @@ def main() -> None:
     load_llm_weights(paged, ckpt)
     torch.set_default_dtype(torch.float32)
 
-    # Share ONE compiled FM wrapper across engine instances so the CUDA-graph /
+    # Share ONE FM accel wrapper across engine instances so the CUDA-graph /
     # compile cache persists (each run_batch builds a fresh engine).
-    compile_fm = not args.no_compile
-    shared_vfp = (
-        torch.compile(runtime.model.core.velocity_field_predictor,
-                      mode="default", dynamic=False)
-        if compile_fm else None
-    )
+    fm_accel = args.fm_accel or ("compile" if not args.no_compile else "none")
+    if fm_accel == "compile":
+        shared_vfp = torch.compile(runtime.model.core.velocity_field_predictor,
+                                   mode="default", dynamic=False)
+    elif fm_accel == "cudagraph":
+        from nanovllm_dots.models.dots.cudagraph_dit import CudaGraphRunner, make_dit_capture_safe
+        make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
+        shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
+    else:
+        shared_vfp = None
 
     def run_batch(n: int):
         eng = DotsBatchEngine(
             runtime, paged, model_dir=args.model,
             num_kvcache_blocks=256, block_size=256, max_num_seqs=max(n, 8),
-            compile_fm=compile_fm, fm_vfp=shared_vfp,
+            fm_accel=fm_accel, fm_vfp=shared_vfp, fm_len_bucket=0,
         )
         texts = ([EN1, ZH1] * ((n + 1) // 2))[:n]
         for i, t in enumerate(texts):
@@ -90,7 +96,7 @@ def main() -> None:
         frames = sum(v.size(1) for v in out.values())
         return wall, frames
 
-    print(f"compile_fm={compile_fm}")
+    print(f"fm_accel={fm_accel}")
     print(f"{'conc':>5} {'wall_s':>8} {'frames':>7} {'audio_s':>8} "
           f"{'thrpt(x_rt)':>11} {'RTF/req':>8}")
     for n in levels:

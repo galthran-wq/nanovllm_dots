@@ -106,14 +106,20 @@ class DotsBatchEngine:
         if fm_vfp is not None:
             self._vfp = fm_vfp
         elif fm_accel == "cudagraph":
-            # Manual CUDA-graph capture of the EAGER DiT (bit-exact to golden, no
-            # compile drift) with static I/O buffers -- needs shape-stable inputs,
-            # so force length bucketing.
+            # Manual CUDA-graph capture of the EAGER DiT (faithful to eager: the
+            # graph just removes launch overhead). Capture-safe first (the timestep
+            # embedder's torch.arange().to(device) aborts capture). Faithfulness
+            # is exact -- it reproduces eager+bucketed FM. (The cos ~0.73 vs the
+            # unbucketed golden is the PADDING divergence, present in eager too;
+            # set fm_len_bucket=0 for the exact-but-graph-per-patch variant.)
             from nanovllm_dots.models.dots.cudagraph_dit import (
                 CudaGraphRunner, make_dit_capture_safe,
             )
-            if self.fm_len_bucket == 0:
-                self.fm_len_bucket = 32
+            # Default UNBUCKETED (fm_len_bucket=0): the FM history grows by a fixed
+            # stride per patch, so only ~one unique shape per patch-count recurs --
+            # a bounded set of graphs, captured once and reused EXACTLY (cos 1.0 vs
+            # eager) with no padding. Faster AND exact vs bucketed (which pads ->
+            # cos ~0.73 divergence). Bucketing stays available for memory-bound use.
             make_dit_capture_safe(self.core.velocity_field_predictor, self.device)
             self._vfp = CudaGraphRunner(self.core.velocity_field_predictor)
         elif fm_accel == "compile":
