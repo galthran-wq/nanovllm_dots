@@ -37,7 +37,8 @@ def main() -> None:
     ap.add_argument("--num-steps", type=int, default=10)
     ap.add_argument("--guidance-scale", type=float, default=1.2)
     ap.add_argument("--no-compile", action="store_true", help="disable FM torch.compile")
-    ap.add_argument("--fm-accel", default=None, choices=["none", "compile", "cudagraph"],
+    ap.add_argument("--fm-accel", default=None,
+                    choices=["none", "compile", "cudagraph", "kvcache"],
                     help="FM acceleration (overrides --no-compile)")
     args = ap.parse_args()
     levels = [int(x) for x in args.concurrency.split(",")]
@@ -77,6 +78,7 @@ def main() -> None:
         make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
         shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
     else:
+        # kvcache builds per-seq CachedFMHead internally; none => eager DiT.
         shared_vfp = None
 
     def run_batch(n: int):

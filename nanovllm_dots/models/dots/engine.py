@@ -64,6 +64,7 @@ class DotsSeqState:
     guidance_scale: float = 1.2
     ode_method: str = "euler"
     eos_threshold: float = 0.8
+    fm_head: Any = None               # per-seq CachedFMHead (fm_accel="kvcache")
 
 
 class DotsBatchEngine:
@@ -129,6 +130,12 @@ class DotsBatchEngine:
                 self.core.velocity_field_predictor, mode=fm_compile_mode,
                 dynamic=(fm_len_bucket == 0),
             )
+        elif fm_accel == "kvcache":
+            # Per-timestep prefix KV cache: O(P) instead of O(P^2). FM runs through
+            # per-seq CachedFMHead objects (built lazily in _kvcache_fm); the DiT
+            # forward is eager here (a fixed-shape active forward to cudagraph is a
+            # later step). self._vfp is the eager DiT the heads call.
+            self._vfp = self.core.velocity_field_predictor
         else:
             self._vfp = self.core.velocity_field_predictor
 
@@ -330,9 +337,40 @@ class DotsBatchEngine:
                 self.scheduler.finish(seq)
         return seqs
 
+    def _kvcache_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
+        """Per-timestep KV-cache FM. Each request carries its own CachedFMHead
+        (own cond/uncond prefix cache that grows with its history), so per-patch
+        work is O(1) in history length. Single-stream for now -- the active
+        forwards run per request; cross-request batching is the next step.
+        Returns [N, patch_size, latent_dim]."""
+        from nanovllm_dots.models.dots.cached_fm import CachedFMHead
+
+        core = self.core
+        lp, ld = core.latent_patch_size, core.latent_dim
+        outs = []
+        for p in payloads:
+            st = p.gen_state
+            if p.ode_method != "euler":
+                raise RuntimeError("fm_accel='kvcache' supports ode_method='euler' only.")
+            if p.fm_head is None:
+                p.fm_head = CachedFMHead(
+                    core, num_steps=p.num_steps, guidance_scale=p.guidance_scale,
+                    dit=self._vfp,
+                )
+            if p.g_cond is not None:
+                gcond = p.g_cond.to(self.device, self.dtype).reshape(1, -1)
+            else:
+                gcond = st.fm_null_g_cond.to(self.device, self.dtype)
+            noise = torch.randn((1, lp, ld), device=self.device, dtype=self.dtype)
+            z = p.fm_head.decode_patch(st, noise, gcond)   # [1, lp, ld]
+            outs.append(z[0])
+        return torch.stack(outs, dim=0)                    # [N, lp, ld]
+
     def _batched_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
         """Pad every active sequence's FM history into one batch and integrate
         the CFG ODE together. Returns [N, patch_size, latent_dim] (normalized)."""
+        if self.fm_accel == "kvcache":
+            return self._kvcache_fm(payloads)
         from nanovllm_dots.models.dots.batched_fm import batched_flow_matching
 
         core, dots = self.core, self.dots
