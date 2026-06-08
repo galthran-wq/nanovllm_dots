@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from torchdiffeq import odeint
 
 from dots_tts.modules.backbone.layers import apply_rotary_pos_emb
 
@@ -90,9 +91,17 @@ class FMCache:
             [None] * num_layers for _ in range(num_steps)
         ]
 
+    def length_at(self, k_index: int) -> int:
+        slot = self.kv[k_index][0]
+        return 0 if slot is None else slot[0].size(2)
+
     def length(self) -> int:
-        first = self.kv[0][0]
-        return 0 if first is None else first[0].size(2)
+        # canonical prefix length; valid only when all timesteps are in lockstep
+        # (i.e. between full decode_patch calls, not mid-extend-loop). Asserts it.
+        lens = {self.length_at(k) for k in range(self.num_steps)}
+        if len(lens) != 1:
+            raise RuntimeError(f"FMCache timesteps out of lockstep: lengths={sorted(lens)}")
+        return lens.pop()
 
 
 def _build_c(dit, t_scalar: torch.Tensor, g_cond: torch.Tensor | None, batch: int):
@@ -130,8 +139,9 @@ def extend_cache(dit, cache: FMCache, x_new, pos_new, t_scalar, g_cond, k_index:
     h = dit.input_layer(x_new)
 
     # additive attn bias for the new rows' queries over [cache (P) | new (m)]:
-    # cache fully visible, new rows causal among themselves.
-    P = cache.length()
+    # cache fully visible, new rows causal among themselves. P is this timestep's
+    # own cache length (timesteps grow independently within a decode_patch call).
+    P = cache.length_at(k_index)
     neg = torch.finfo(h.dtype).min
     causal = torch.triu(torch.ones(m, m, device=h.device, dtype=torch.bool), 1)
     bias = torch.zeros(m, P + m, device=h.device, dtype=h.dtype)
@@ -185,3 +195,115 @@ def active_forward(dit, cache: FMCache, x_active, pos_active, t_scalar, g_cond, 
         h = h + g_a * out_proj(attn, o)
         h = h + g_f * block.ffn(modulate(block.norm2(h), s_f, sc_f))
     return final_velocity(dit, h, c)
+
+
+class CachedFMHead:
+    """Per-stream cached flow-matching head: integrates the CFG ODE for one patch
+    using the per-timestep prefix KV cache, recomputing only the 5 active rows.
+
+    Holds a cond and an uncond `FMCache` (one prefix-K/V history per CFG branch).
+    `decode_patch` is called once per audio patch; it (1) extends the caches by
+    the prefix rows that have finalized since the last call (read from the
+    ground-truth `fm_sequence`/`fm_cfg_sequence` buffers the engine maintains),
+    then (2) runs the EULER ODE over the active rows against the caches.
+
+    Scope: ode_method == "euler" (the production/golden path; midpoint/rk4 would
+    need cache entries at the intermediate eval times -- the engine keeps the
+    uncached batched_fm for those). num_steps/guidance_scale are fixed for the
+    life of one stream (the caches are indexed by the euler timestep grid).
+    """
+
+    def __init__(self, core, *, num_steps: int, guidance_scale: float, dit=None):
+        self.core = core
+        self.dit = dit if dit is not None else core.velocity_field_predictor
+        self.num_steps = num_steps
+        self.guidance_scale = float(guidance_scale)
+        self.hp = core.hidden_patch_size
+        self.lp = core.latent_patch_size
+        self.latent_dim = core.latent_dim
+        n_layers = self.dit.num_layers
+        self.cc = FMCache(num_steps, n_layers)   # cond branch prefix cache
+        self.uc = FMCache(num_steps, n_layers)   # uncond branch prefix cache
+        self.cached_P = 0                        # prefix rows already cached
+        # euler grid, matching torchdiffeq's fixed-step solver on times=[0,1] with
+        # step_size=1/num_steps: it builds the grid in the integ dtype (bf16), so
+        # the eval times t_k = bf16(k/num_steps) and the per-step dt_k =
+        # grid[k+1]-grid[k] both carry bf16 rounding. We replicate exactly (a plain
+        # constant 0.1 step diverges ~1%/step -> several % on stiff patches).
+        self._grid = None       # [num_steps+1] eval/endpoint times
+        self._dts = None        # [num_steps] per-step dt
+
+    def _ensure_grid(self, device, dtype) -> None:
+        if self._grid is not None and self._grid.device == device and self._grid.dtype == dtype:
+            return
+        g = (torch.arange(self.num_steps + 1, device=device, dtype=torch.float32)
+             / self.num_steps).to(dtype)
+        self._grid = g
+        self._dts = g[1:] - g[:-1]
+
+    def _t(self, k: int, device, dtype) -> torch.Tensor:
+        self._ensure_grid(device, dtype)
+        return self._grid[k]
+
+    @torch.no_grad()
+    def extend_for_patch(self, state, g_cond) -> None:
+        """(Step 1 of a patch) Extend the cond/uncond caches by the prefix rows
+        that finalized since the last patch ([cached_P : fm_seq_len-1], read from
+        the ground-truth fm buffers), at every ODE timestep. Then stash the active-
+        row context (last hidden + positions) for `velocity`."""
+        core, dit = self.core, self.dit
+        L = int(state.fm_seq_len)
+        seq, cfg = state.fm_sequence, state.fm_cfg_sequence
+        dev, dt = seq.device, seq.dtype
+        g_u = torch.zeros_like(g_cond)
+        self._ensure_grid(dev, dt)
+
+        if L - 1 > self.cached_P:
+            s, e = self.cached_P, L - 1
+            new_c, new_u = seq[:, s:e], cfg[:, s:e]
+            pos_new = torch.arange(s, e, device=dev, dtype=torch.float32).reshape(1, -1)
+            for k in range(self.num_steps):
+                tk = self._grid[k]
+                extend_cache(dit, self.cc, new_c, pos_new, tk, g_cond, k)
+                extend_cache(dit, self.uc, new_u, pos_new, tk, g_u, k)
+            self.cached_P = e
+
+        a = self.hp + self.lp
+        self._L = L
+        self._hid_c = seq[:, L - 1 : L]                   # [1, hp, H]
+        self._hid_u = cfg[:, L - 1 : L]
+        self._pos_act = torch.arange(L - 1, L - 1 + a, device=dev, dtype=torch.float32).reshape(1, -1)
+        self._g_cond, self._g_u = g_cond, g_u
+
+    @torch.no_grad()
+    def velocity(self, z, t_scalar, k_index: int) -> torch.Tensor:
+        """One CFG ODE eval at timestep `k_index`: active rows (last hidden +
+        coordinate_proj(z)) read the cached prefix K/V. Returns [B, lp, latent]."""
+        core, dit = self.core, self.dit
+        B = z.size(0)
+        hid_c = self._hid_c.expand(B, -1, -1)
+        hid_u = self._hid_u.expand(B, -1, -1)
+        pos = self._pos_act.expand(B, -1)
+        zp = core.coordinate_proj(z)                      # [B, lp, H]
+        xc = torch.cat([hid_c, zp], dim=1)
+        xu = torch.cat([hid_u, zp], dim=1)
+        vc = active_forward(dit, self.cc, xc, pos, t_scalar, self._g_cond, k_index)[:, self.hp :]
+        vu = active_forward(dit, self.uc, xu, pos, t_scalar, self._g_u, k_index)[:, self.hp :]
+        gs = z.new_tensor(self.guidance_scale)
+        return vc + gs * (vc - vu)
+
+    @torch.no_grad()
+    def decode_patch(self, state, noise, g_cond) -> torch.Tensor:
+        """Integrate one patch's CFG euler ODE -> [B, lp, latent_dim] (raw z, pre
+        denorm, matching `batched_flow_matching`'s return). Uses the same fixed
+        euler grid/dt as torchdiffeq's `odeint` (bit-identical integrator) but as a
+        static python loop (no per-step host sync; cudagraph-friendly).
+
+        noise:  [B, lp, latent_dim] ODE init (the engine/caller owns the draw).
+        g_cond: [B, model_dim] cond-branch global condition (uncond uses zeros).
+        """
+        self.extend_for_patch(state, g_cond)
+        z = noise.clone()
+        for k in range(self.num_steps):
+            z = z + self._dts[k] * self.velocity(z, self._grid[k], k)
+        return z
