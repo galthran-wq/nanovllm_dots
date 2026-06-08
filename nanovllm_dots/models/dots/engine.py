@@ -220,41 +220,92 @@ class DotsBatchEngine:
             chunks.append(chunk)
             block_tables.append(seq.block_table)
             cached_lens.append(seq.num_cached_tokens if is_prefill else len(seq) - 1)
+        dots = self.dots
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             hiddens = self.batched_llm.append_batch(chunks, block_tables, cached_lens)
 
-            # 2) per-seq: seed/append hidden, eos, FM -> patch, patch_encoder -> next embed
+            # 2) pre-FM (per seq, cheap): seed/append the hidden chunk, eos check.
+            stops = []
             for seq, hidden in zip(seqs, hiddens):
-                st = seq.custom_payload
-                last_hidden = hidden[-1:].unsqueeze(0)  # [1, 1, H]
-                self._advance_one_patch(seq, st, last_hidden)
+                state = seq.custom_payload.gen_state
+                state.llm_hiddens = hidden[-1:].unsqueeze(0)  # [1, 1, H]
+                dots._append_hidden_chunk(state, state.llm_hiddens)
+                stops.append(
+                    dots._should_stop_after_current_audio(
+                        state, eos_threshold=seq.custom_payload.eos_threshold
+                    )
+                )
+
+            # 3) batched FM ODE over ALL active sequences at once (the 81% hog).
+            latents = self._batched_fm([s.custom_payload for s in seqs])
+
+            # 4) post-FM (per seq): history append + patch encoder + emit + stop.
+            for seq, latent, stop in zip(seqs, latents, stops):
+                self._finish_patch(seq, seq.custom_payload, latent.unsqueeze(0), stop)
 
         for seq in seqs:
             if seq.stoped:
                 self.scheduler.finish(seq)
         return seqs
 
-    def _advance_one_patch(self, seq: Sequence, st: DotsSeqState, last_hidden: torch.Tensor) -> None:
-        dots, core = self.dots, self.core
-        state = st.gen_state
-        state.llm_hiddens = last_hidden
-        # seed (prefill) or append (decode) the hidden chunk into FM history
-        dots._append_hidden_chunk(state, last_hidden)
-        stop = dots._should_stop_after_current_audio(state, eos_threshold=st.eos_threshold)
+    def _batched_fm(self, payloads: list[DotsSeqState]) -> torch.Tensor:
+        """Pad every active sequence's FM history into one batch and integrate
+        the CFG ODE together. Returns [N, patch_size, latent_dim] (normalized)."""
+        from nanovllm_dots.models.dots.batched_fm import batched_flow_matching
 
-        patch = dots._decode_next_audio(
-            state, device=self.device, g_cond=st.g_cond,
-            ode_method=st.ode_method, num_steps=st.num_steps,
-            guidance_scale=st.guidance_scale,
+        core, dots = self.core, self.dots
+        states = [p.gen_state for p in payloads]
+        n = len(states)
+        # One odeint call integrates the whole batch, so the ODE schedule and CFG
+        # must be uniform across co-active requests. Fail loud rather than silently
+        # decode some requests with the wrong NFE/guidance.
+        p0 = payloads[0]
+        for p in payloads:
+            if (p.num_steps, p.guidance_scale, p.ode_method) != (
+                p0.num_steps, p0.guidance_scale, p0.ode_method
+            ):
+                raise RuntimeError(
+                    "batched FM requires uniform (num_steps, guidance_scale, ode_method) "
+                    "across co-active requests; got mismatched decode params."
+                )
+        max_len = max(st.fm_seq_len for st in states)
+        total_len = max_len + core.latent_patch_size
+        H = core.fm_hidden_size
+        dev, dt = self.device, self.dtype
+
+        inp = torch.zeros(n, total_len, H, device=dev, dtype=dt)
+        cfg = torch.zeros(n, total_len, H, device=dev, dtype=dt)
+        mask = torch.zeros(n, total_len, total_len, dtype=torch.bool, device=dev)
+        pos = torch.zeros(n, total_len, dtype=torch.float32, device=dev)
+        gcond = torch.zeros(n, H, device=dev, dtype=dt)
+        for i, (st, p) in enumerate(zip(states, payloads)):
+            L = st.fm_seq_len
+            inp[i, :L] = st.fm_sequence[0, :L]
+            cfg[i, :L] = st.fm_cfg_sequence[0, :L]
+            # _build_fm_* fill a [1, total_len, ...] view in place (zero + structure);
+            # padding gap [L:max_len] is self-masked, positions stay per-seq correct.
+            dots._build_fm_attn_mask(state=st, attn_mask=mask[i : i + 1])
+            dots._build_fm_pos_ids(state=st, pos_ids=pos[i : i + 1])
+            if p.g_cond is not None:
+                gcond[i] = p.g_cond.to(dev, dt)
+            elif st.fm_null_g_cond is not None:
+                gcond[i] = st.fm_null_g_cond[0]
+
+        return batched_flow_matching(
+            core, input_sequence=inp, cfg_sequence=cfg, attn_mask=mask, pos_ids=pos,
+            g_cond=gcond, num_steps=p0.num_steps, guidance_scale=p0.guidance_scale,
+            ode_method=p0.ode_method,
         )
+
+    def _finish_patch(self, seq: Sequence, st: DotsSeqState, patch: torch.Tensor, stop: bool) -> None:
+        core = self.core
         # next LLM input = patch encoder over this patch (history append + encode)
-        st.next_embed = self._patch_to_embed(state, patch)
+        st.next_embed = self._patch_to_embed(st.gen_state, patch)
 
         latent_cpu = core.io_helper.denormalize(patch).detach().float().cpu()
         st.latents.append(latent_cpu)
         st.patches_emitted += 1
         st.position += 1
-
         # advance the KV sequence by one token (this patch's encoder embedding,
         # consumed by the LLM on the next decode step)
         seq.append_token(latent_cpu.reshape(-1).numpy().tobytes())
