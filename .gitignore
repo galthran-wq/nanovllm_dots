@@ -1,0 +1,21 @@
+# virtualenv
+.venv/
+
+# model weights (9.5GB, fetched via huggingface_hub)
+models/
+
+# golden reference audio/latents (regenerate via scripts/gen_golden.py); keep manifest
+golden/*.wav
+golden/*.npy
+
+# vendored upstream reference (clone of github.com/rednote-hilab/dots.tts)
+reference/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+*.whl
+
+# misc
+*.log
