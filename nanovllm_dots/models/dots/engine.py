@@ -81,6 +81,7 @@ class DotsBatchEngine:
         fm_vfp=None,
         fm_len_bucket: int = 0,
         fm_compile_mode: str = "default",
+        fm_accel: str | None = None,   # "compile" | "cudagraph" | "none"
     ) -> None:
         self.runtime = runtime
         self.dots = runtime.model                 # DotsTtsModel: core/patch_encoder/FM/vocoder
@@ -98,11 +99,24 @@ class DotsBatchEngine:
         # ODE solver feeds each vfp output back as the next input, and the graph
         # reuses output memory. Use "default" until outputs are cloned/captured
         # safely (separate step).
-        self.compile_fm = compile_fm
+        if fm_accel is None:
+            fm_accel = "compile" if compile_fm else "none"
+        self.fm_accel = fm_accel
         self.fm_len_bucket = fm_len_bucket
         if fm_vfp is not None:
             self._vfp = fm_vfp
-        elif compile_fm:
+        elif fm_accel == "cudagraph":
+            # Manual CUDA-graph capture of the EAGER DiT (bit-exact to golden, no
+            # compile drift) with static I/O buffers -- needs shape-stable inputs,
+            # so force length bucketing.
+            from nanovllm_dots.models.dots.cudagraph_dit import (
+                CudaGraphRunner, make_dit_capture_safe,
+            )
+            if self.fm_len_bucket == 0:
+                self.fm_len_bucket = 32
+            make_dit_capture_safe(self.core.velocity_field_predictor, self.device)
+            self._vfp = CudaGraphRunner(self.core.velocity_field_predictor)
+        elif fm_accel == "compile":
             # dynamic=True => one graph handles every history length (no recompile,
             # no length padding). Bucketing is only needed for CUDA-graph capture.
             self._vfp = torch.compile(
@@ -130,6 +144,41 @@ class DotsBatchEngine:
         self._results: dict[str, list[torch.Tensor]] = {}
 
     # ------------------------------------------------------------------ setup
+    @torch.no_grad()
+    def warmup_graphs(self, concurrencies=(1,), max_fm_len: int = 512) -> None:
+        """Pre-capture the FM CUDA graphs for every (batch, length) shape, with
+        dummy inputs, BEFORE serving. Capturing a new bucket mid-generation (lazy)
+        corrupts that run; pre-warming in isolation makes the first real request
+        correct. No-op unless fm_accel == "cudagraph"."""
+        if self.fm_accel != "cudagraph":
+            return
+        import types
+
+        core = self.core
+        H, lp, b = core.fm_hidden_size, core.latent_patch_size, self.fm_len_bucket
+        dev, dt = self.device, self.dtype
+        buckets = list(range(b, max_fm_len + b, b))
+        with torch.autocast(device_type=dev.type, dtype=dt):
+            for nconc in concurrencies:
+                bs = 2 * nconc  # CFG doubles the batch
+                for L in buckets:
+                    total = L + lp
+                    # Capture with REALISTIC inputs (random x, the real structured
+                    # FM mask/pos), not zeros: an all-zero x degenerates SDPA at
+                    # capture and the replayed graph stays wrong. Mask/pos values
+                    # are still copied per call; only the captured kernels matter.
+                    st = types.SimpleNamespace(fm_seq_len=L)
+                    mask = torch.zeros(1, total, total, dtype=torch.bool, device=dev)
+                    pos = torch.zeros(1, total, dtype=torch.float32, device=dev)
+                    self.dots._build_fm_attn_mask(state=st, attn_mask=mask)
+                    self.dots._build_fm_pos_ids(state=st, pos_ids=pos)
+                    self._vfp(
+                        x=torch.randn(bs, total, H, device=dev, dtype=dt),
+                        timesteps=torch.rand(bs, device=dev, dtype=dt),
+                        attn_mask=mask.expand(bs, -1, -1).contiguous(),
+                        pos_ids=pos.expand(bs, -1).contiguous(),
+                        g_cond=torch.zeros(bs, H, device=dev, dtype=dt),
+                    )
     def _alloc_private_state(self, span_count: int):
         """dots `_GenerateState` with PRIVATE FM buffers (not the shared cache)."""
         from dots_tts.models.dots_tts.model import _GenerateState
