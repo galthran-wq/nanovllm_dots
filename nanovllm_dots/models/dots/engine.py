@@ -322,7 +322,19 @@ class DotsBatchEngine:
         eos_threshold: float = 0.8,
         max_patches: int | None = None,
         stream: bool = True,
+        prompt_audio_path: str | None = None,
+        speaker_scale: float = 1.5,
     ) -> None:
+        # Voice cloning step A: speaker conditioning (g_cond). The reference audio's
+        # x-vector -> core.xvec_proj -> g_cond steers the FM head toward that timbre.
+        # (Step B will additionally prefill the prompt audio in-context.)
+        g_cond = None
+        if prompt_audio_path is not None:
+            prompt_audio = self.runtime._load_prompt_audio(prompt_audio_path).to(self.device)
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                cond = self.dots._prepare_prompt_conditioning(
+                    prompt_audio, use_prompt_prefill=False, speaker_scale=speaker_scale)
+            g_cond = cond.g_cond                      # [1, fm_hidden_size]
         inputs = self.runtime._prepare_inputs(
             text=text, prompt_audio_path=None, prompt_text=None,
             template_name=None, language=None, normalize_text=False,
@@ -359,7 +371,7 @@ class DotsBatchEngine:
             schedule=schedule,
             prefill_end=prefill_end,
             span_count=span_count,
-            g_cond=None,
+            g_cond=g_cond,
             gen_state=state,
             prefill_embed=prefill_embed,
             position=prefill_end,
@@ -590,7 +602,7 @@ class DotsBatchEngine:
             dots._build_fm_attn_mask(state=st, attn_mask=mask[i : i + 1])
             dots._build_fm_pos_ids(state=st, pos_ids=pos[i : i + 1])
             if p.g_cond is not None:
-                gcond[i] = p.g_cond.to(dev, dt)
+                gcond[i] = p.g_cond.to(dev, dt).reshape(-1)
             elif st.fm_null_g_cond is not None:
                 gcond[i] = st.fm_null_g_cond[0]
         return inp, cfg, mask, pos, gcond, p0, meanflow
