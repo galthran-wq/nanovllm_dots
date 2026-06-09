@@ -190,7 +190,8 @@ class DotsStreamServer:
                        guidance_scale: float = 1.2, eos_threshold: float = 0.8,
                        max_patches: int | None = None,
                        stream: bool = True, prompt_audio_path: str | None = None,
-                       speaker_scale: float = 1.5) -> AsyncIterator[torch.Tensor]:
+                       prompt_text: str | None = None, speaker_scale: float = 1.5,
+                       clone_prefill: bool = True) -> AsyncIterator[torch.Tensor]:
         """Yield 48 kHz wav chunks (1-D float CPU tensors) for `text`. stream=True
         vocodes per-patch (low latency, many small chunks); stream=False vocodes
         once at the end (one big chunk, much higher throughput). Concurrent calls
@@ -203,7 +204,8 @@ class DotsStreamServer:
         self._intake.put(("req", seq_id, text, dict(
             num_steps=num_steps, guidance_scale=guidance_scale,
             eos_threshold=eos_threshold, max_patches=max_patches, stream=stream,
-            prompt_audio_path=prompt_audio_path, speaker_scale=speaker_scale)))
+            prompt_audio_path=prompt_audio_path, prompt_text=prompt_text,
+            speaker_scale=speaker_scale, clone_prefill=clone_prefill)))
         finished = False
         try:
             while True:

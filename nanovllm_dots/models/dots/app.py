@@ -31,6 +31,13 @@ class GenerateRequest(BaseModel):
     num_steps: int = 4
     guidance_scale: float = 1.2
     eos_threshold: float = 0.8
+    # voice cloning: server-side path to a reference wav (+ its transcript for the
+    # stronger in-context prefill). prompt_text optional; clone_prefill=False for
+    # g_cond-only (timbre).
+    prompt_audio_path: str | None = None
+    prompt_text: str | None = None
+    speaker_scale: float = 1.5
+    clone_prefill: bool = True
 
 
 def _pcm16(wav: torch.Tensor) -> bytes:
@@ -79,7 +86,9 @@ async def generate(req: GenerateRequest) -> Response:
     """Full waveform as a complete WAV (one-shot vocode)."""
     wav = await _server.generate_wav(
         req.text, num_steps=req.num_steps, guidance_scale=req.guidance_scale,
-        eos_threshold=req.eos_threshold)
+        eos_threshold=req.eos_threshold, prompt_audio_path=req.prompt_audio_path,
+        prompt_text=req.prompt_text, speaker_scale=req.speaker_scale,
+        clone_prefill=req.clone_prefill)
     pcm = _pcm16(wav)
     body = _wav_header(_server.sample_rate, len(pcm)) + pcm
     return Response(content=body, media_type="audio/wav")
@@ -95,7 +104,9 @@ async def generate_stream(req: GenerateRequest) -> StreamingResponse:
         async for chunk in _server.generate(
                 req.text, num_steps=req.num_steps,
                 guidance_scale=req.guidance_scale,
-                eos_threshold=req.eos_threshold, stream=True):
+                eos_threshold=req.eos_threshold, stream=True,
+                prompt_audio_path=req.prompt_audio_path, prompt_text=req.prompt_text,
+                speaker_scale=req.speaker_scale, clone_prefill=req.clone_prefill):
             yield _pcm16(chunk)
 
     return StreamingResponse(body(), media_type="audio/wav")
