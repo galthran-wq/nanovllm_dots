@@ -51,6 +51,8 @@ def main() -> None:
                     help="torch.compile the patch_encoder decode_patch")
     ap.add_argument("--flash-pe", action="store_true",
                     help="flash/varlen BATCHED patch_encoder decode")
+    ap.add_argument("--int8-dit", action="store_true",
+                    help="W8A8 int8-quantize the DiT linears (exploratory)")
     args = ap.parse_args()
     levels = [int(x) for x in args.concurrency.split(",")]
 
@@ -77,6 +79,11 @@ def main() -> None:
         paged = QwenLLM(cfg).eval()
     load_llm_weights(paged, ckpt)
     torch.set_default_dtype(torch.float32)
+
+    if args.int8_dit:
+        from nanovllm_dots.models.dots.int8_dit import quantize_dit_
+        nq = quantize_dit_(runtime.model.core.velocity_field_predictor)
+        print(f"int8-dit: quantized {nq} DiT linears")
 
     # Share ONE FM accel wrapper across engine instances so the CUDA-graph /
     # compile cache persists (each run_batch builds a fresh engine).
