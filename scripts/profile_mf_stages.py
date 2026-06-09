@@ -56,7 +56,13 @@ def main() -> None:
     ap.add_argument("--graph-decode", action="store_true")
     ap.add_argument("--compile-pe", action="store_true",
                     help="torch.compile the patch_encoder decode_patch (static shapes)")
+    ap.add_argument("--flash-pe", action="store_true",
+                    help="flash/varlen BATCHED patch_encoder decode")
     ap.add_argument("--text-repeat", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="number of simultaneous requests (batched pipeline)")
+    ap.add_argument("--fixed-len", type=int, default=0,
+                    help="stop after exactly N patches (eos off) -> identical length")
     args = ap.parse_args()
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -89,18 +95,25 @@ def main() -> None:
     if args.fm_accel == "cudagraph":
         make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
         shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
-    if args.compile_pe:
-        pe = runtime.model.core.patch_encoder
-        pe.decode_patch = torch.compile(pe.decode_patch, dynamic=False)
+
+    ZH1 = "这是一个用于回归测试的参考样本。"
+    n = args.concurrency
 
     def build():
         eng = DotsBatchEngine(
             runtime, paged, model_dir=args.model, num_kvcache_blocks=256,
-            block_size=256, max_num_seqs=8, fm_accel=args.fm_accel,
+            block_size=256, max_num_seqs=max(n, 8), fm_accel=args.fm_accel,
             fm_vfp=shared_vfp, fm_len_bucket=0, graph_decode=args.graph_decode,
+            compile_pe=args.compile_pe, flash_pe=args.flash_pe,
         )
-        text = " ".join([EN1] * args.text_repeat)
-        eng.add_request("r0", text, num_steps=args.num_steps, guidance_scale=1.2)
+        texts = ([EN1, ZH1] * ((n + 1) // 2))[:n]
+        texts = [" ".join([t] * args.text_repeat) for t in texts]
+        eos_thr = 2.0 if args.fixed_len else 0.8
+        cap = args.fixed_len or None
+        for i, t in enumerate(texts):
+            eng.add_request(f"r{i}", t, num_steps=args.num_steps,
+                            guidance_scale=1.2, eos_threshold=eos_thr,
+                            max_patches=cap)
         return eng
 
     # warmup (capture graphs)
@@ -110,7 +123,10 @@ def main() -> None:
     llm, fm, pe = Acc(), Acc(), Acc()
     eng.batched_llm.append_batch = timed(llm, eng.batched_llm.append_batch)
     eng._batched_fm = timed(fm, eng._batched_fm)
-    eng._patch_to_embed = timed(pe, eng._patch_to_embed)
+    if args.flash_pe:
+        eng._flash_pe.decode_patch = timed(pe, eng._flash_pe.decode_patch)
+    else:
+        eng._patch_to_embed = timed(pe, eng._patch_to_embed)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()

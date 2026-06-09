@@ -66,6 +66,7 @@ class DotsSeqState:
     eos_threshold: float = 0.8
     max_patches: int | None = None    # hard cap on emitted patches (benchmarking)
     fm_head: Any = None               # per-seq CachedFMHead (fm_accel="kvcache")
+    pe_row: int | None = None         # cache row in the shared FlashPatchEncoder
 
 
 class DotsBatchEngine:
@@ -90,6 +91,10 @@ class DotsBatchEngine:
                                        # already wins by L~250/16s, cudagraph by L~105/3.5s)
         graph_decode: bool = False,    # CUDA-graph the one-token LLM decode forward
         compile_pe: bool = False,      # torch.compile the patch_encoder decode_patch
+        flash_pe: bool = False,        # flash/varlen BATCHED patch_encoder decode
+        pe_max_patches: int = 256,     # shared FlashPatchEncoder history capacity
+        pe_max_batch: int | None = None,  # flash_pe cache rows (default max_num_seqs);
+                                          # must bound CONCURRENTLY generating seqs
     ) -> None:
         self.kvcache_graphed = kvcache_graphed
         self.hybrid_threshold = hybrid_threshold
@@ -181,6 +186,33 @@ class DotsBatchEngine:
                 pe.decode_patch = torch.compile(pe.decode_patch, dynamic=False)
                 pe._decode_patch_compiled = True
 
+        # flash/varlen BATCHED patch_encoder: replaces the per-seq dense-mask SDPA
+        # over the FIXED cache_capacity (O(capacity)/patch, run once per request ->
+        # LINEAR in concurrency, the throughput wall) with ONE flash_attn_with_kvcache
+        # call over ALL active requests, each attending only its own actual history
+        # (cache_batch_idx -> a persistent cache row per request). Quality-free
+        # (faithful to decode_patch, cos 0.99999). See flash_patch_encoder.py.
+        self.flash_pe = flash_pe
+        self._pe_max_patches = pe_max_patches
+        if flash_pe:
+            from nanovllm_dots.models.dots.flash_patch_encoder import FlashPatchEncoder
+            pe = self.core.patch_encoder
+            # Rows are claimed for a request's whole generation (not per step), so the
+            # pool must cover every CONCURRENTLY generating sequence. The decode batch
+            # is capped at max_num_seqs, but the scheduler's running set can exceed it
+            # when many requests are queued (prefill admits up to max_num_seqs/call and
+            # returns early). Size to pe_max_batch (>= the true running cap) and fail
+            # loudly rather than corrupt memory; a server should set max_num_seqs to
+            # bound concurrency and pe_max_batch to match.
+            n_rows = pe_max_batch if pe_max_batch is not None else max_num_seqs
+            self._pe_max_batch = n_rows
+            self._flash_pe = FlashPatchEncoder(
+                pe, max_batch=n_rows,
+                max_seq_len=pe_max_patches * pe.out_ds_rate,
+                device=self.device, dtype=self.dtype,
+            )
+            self._pe_free = list(range(n_rows))
+
         self.batched_llm = BatchedPagedLLM(
             paged_llm, num_blocks=num_kvcache_blocks, block_size=block_size,
             device=self.device, dtype=self.dtype, graph_decode=graph_decode,
@@ -249,12 +281,24 @@ class DotsBatchEngine:
 
         core = self.core
         patch_count = self.dots._resolve_state_audio_patch_count(span_count)
+        # flash_pe shares a fixed-capacity history cache (cap = pe_max_patches *
+        # out_ds_rate). Bound each request's emitted patches here (host-side, no
+        # per-step GPU sync) so flash_attn_with_kvcache can never write past the
+        # cache. The stop rule caps emitted patches at <= patch_count, so this is
+        # sufficient.
+        if self.flash_pe and patch_count > self._pe_max_patches:
+            raise RuntimeError(
+                f"flash_pe: request needs {patch_count} patches but pe_max_patches="
+                f"{self._pe_max_patches}. Increase pe_max_patches.")
         fm_capacity = patch_count * (core.hidden_patch_size + core.latent_patch_size)
         z = lambda *s: torch.zeros(*s, dtype=self.dtype, device=self.device)
-        patch_encoder_state = core.patch_encoder.init_decode_state(
-            max_audio_patch_count=patch_count, batch_size=1,
-            device=self.device, dtype=self.dtype,
-        )
+        # flash_pe owns a shared patch_encoder cache (FlashPatchEncoder); the
+        # per-seq reference cache (~100MB/seq at 256 patches) is then unused.
+        patch_encoder_state = None if self.flash_pe else \
+            core.patch_encoder.init_decode_state(
+                max_audio_patch_count=patch_count, batch_size=1,
+                device=self.device, dtype=self.dtype,
+            )
         return _GenerateState(
             patch_encoder_state=patch_encoder_state,
             fm_seq_len=0,
@@ -381,12 +425,21 @@ class DotsBatchEngine:
             # 3) batched FM ODE over ALL active sequences at once (the 81% hog).
             latents = self._batched_fm([s.custom_payload for s in seqs])
 
-            # 4) post-FM (per seq): history append + patch encoder + emit + stop.
-            for seq, latent, stop in zip(seqs, latents, stops):
-                self._finish_patch(seq, seq.custom_payload, latent.unsqueeze(0), stop)
+            # 4) post-FM: history append + patch encoder + emit + stop. The patch
+            # encoder is BATCHED over all active seqs in one flash call (flash_pe)
+            # or run per-seq (reference dense-mask path).
+            if self.flash_pe:
+                self._finish_patches_flash(seqs, latents, stops)
+            else:
+                for seq, latent, stop in zip(seqs, latents, stops):
+                    self._finish_patch(seq, seq.custom_payload, latent.unsqueeze(0), stop)
 
         for seq in seqs:
             if seq.stoped:
+                p = seq.custom_payload
+                if self.flash_pe and p.pe_row is not None:
+                    self._pe_free.append(p.pe_row)   # recycle the cache row
+                    p.pe_row = None
                 self.scheduler.finish(seq)
         return seqs
 
@@ -569,6 +622,47 @@ class DotsBatchEngine:
         # consumed by the LLM on the next decode step)
         seq.append_token(latent_cpu.reshape(-1).numpy().tobytes())
 
+        schedule_exhausted = st.position >= st.schedule.size(1)
+        cap = st.span_count if st.max_patches is None else min(st.span_count, st.max_patches)
+        if stop or schedule_exhausted or st.patches_emitted >= cap:
+            seq.stoped = True
+
+    def _finish_patches_flash(self, seqs, latents: torch.Tensor, stops) -> None:
+        """Batched post-FM for flash_pe: per-seq FM-history append (cheap) + ONE
+        flash patch_encoder call over all active seqs + per-seq emit/stop. `latents`
+        is [N, patch_size, latent_dim] (normalized, as produced by the FM)."""
+        core, dots = self.core, self.dots
+        rows = []
+        for seq, latent in zip(seqs, latents):
+            st = seq.custom_payload
+            dots._append_history_chunk(st.gen_state, latent.unsqueeze(0))  # normalized
+            if st.pe_row is None:                       # lazily claim a cache row
+                if not self._pe_free:
+                    raise RuntimeError(
+                        f"flash_pe: row pool exhausted ({self._pe_max_batch} rows); "
+                        f"more sequences are generating concurrently. Increase "
+                        f"pe_max_batch or cap concurrency (max_num_seqs).")
+                st.pe_row = self._pe_free.pop()
+                self._flash_pe.reset_rows(
+                    torch.tensor([st.pe_row], device=self.device, dtype=torch.int32))
+            rows.append(st.pe_row)
+        rows_t = torch.tensor(rows, device=self.device, dtype=torch.int32)
+        patches = core.io_helper.denormalize(latents)              # [N, ps, ld]
+        embeds = self._flash_pe.decode_patch(patches, rows_t)      # [N, 1, H]
+        for seq, latent, stop, emb in zip(seqs, latents, stops, embeds):
+            self._emit_patch(seq, seq.custom_payload, latent.unsqueeze(0), emb, stop)
+
+    def _emit_patch(self, seq: Sequence, st: DotsSeqState, patch: torch.Tensor,
+                    emb: torch.Tensor, stop: bool) -> None:
+        """Record one emitted patch (latent + LLM next-input) and apply the stop
+        rule. `emb` is the precomputed patch_encoder embedding [1, H]."""
+        core = self.core
+        st.next_embed = emb
+        latent_cpu = core.io_helper.denormalize(patch).detach().float().cpu()
+        st.latents.append(latent_cpu)
+        st.patches_emitted += 1
+        st.position += 1
+        seq.append_token(latent_cpu.reshape(-1).numpy().tobytes())
         schedule_exhausted = st.position >= st.schedule.size(1)
         cap = st.span_count if st.max_patches is None else min(st.span_count, st.max_patches)
         if stop or schedule_exhausted or st.patches_emitted >= cap:
