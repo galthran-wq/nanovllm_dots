@@ -376,6 +376,21 @@ class DotsBatchEngine:
         self._results[seq_id] = payload.latents
         self.scheduler.add(seq)
 
+    def cancel(self, seq_id: str) -> bool:
+        """Abort an in-flight request: free its KV blocks and flash_pe cache row and
+        drop it from the scheduler. Called (via the server's intake) when a client
+        disconnects, so a zombie sequence can't hold a batch slot forever. Must run
+        on the engine-owning thread (between steps), like every other engine call."""
+        seq = self.scheduler._id_to_seq.get(seq_id)
+        if seq is None:
+            return False
+        p = seq.custom_payload
+        if self.flash_pe and p is not None and p.pe_row is not None:
+            self._pe_free.append(p.pe_row)
+            p.pe_row = None
+        self.scheduler.cancel(seq_id)
+        return True
+
     # ------------------------------------------------------------------- step
     @torch.no_grad()
     def step(self) -> list[Sequence]:

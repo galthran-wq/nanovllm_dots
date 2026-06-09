@@ -102,9 +102,13 @@ class DotsStreamServer:
         """Trigger inductor compilation + decode-graph capture before serving by
         running short dummy batches synchronously. The worker thread owns the engine,
         so pause it for the duration."""
-        self._stop.set(); self._thread.join(timeout=5)
+        # join WITHOUT a timeout: running the engine from two threads at once (the
+        # warmup body + a still-alive worker) corrupts its single-threaded state.
+        self._stop.set(); self._thread.join()
+        assert not self._thread.is_alive()
         eng = self.engine
-        for bs in batch_sizes:
+        cap = getattr(eng, "_pe_max_batch", 1 << 30)   # never warm past the row pool
+        for bs in sorted({min(b, cap) for b in batch_sizes}):
             for i in range(bs):
                 eng.add_request(f"_warm{bs}_{i}", text, num_steps=num_steps,
                                 eos_threshold=2.0, max_patches=patches, stream=False)
@@ -148,28 +152,38 @@ class DotsStreamServer:
         if item[0] == "_stop":
             self._stop.set()
             return
+        if item[0] == "_cancel":
+            self.engine.cancel(item[1])      # client gone: free the batch slot
+            return
         _, seq_id, text, params = item
         try:
             self.engine.add_request(seq_id, text, **params)
         except Exception as e:
             self._dispatch(seq_id, ("error", e))
 
+    @staticmethod
+    def _post(loop, q, payload) -> None:
+        # the target loop may be closed (client gone / shutdown); a raised
+        # RuntimeError here would otherwise kill the worker thread.
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, payload)
+        except RuntimeError:
+            pass
+
     def _dispatch(self, seq_id: str, payload: tuple[str, Any]) -> None:
         with self._lock:
             sub = self._subs.get(seq_id)
             if payload[0] in ("done", "error"):
                 self._subs.pop(seq_id, None)
-        if sub is None:
-            return
-        loop, q = sub
-        loop.call_soon_threadsafe(q.put_nowait, payload)
+        if sub is not None:
+            self._post(sub[0], sub[1], payload)
 
     def _fail_all(self, exc: Exception) -> None:
         with self._lock:
-            subs = list(self._subs.items())
+            subs = list(self._subs.values())
             self._subs.clear()
-        for _, (loop, q) in subs:
-            loop.call_soon_threadsafe(q.put_nowait, ("error", exc))
+        for loop, q in subs:
+            self._post(loop, q, ("error", exc))
 
     # ----------------------------------------------------------- async client
     async def generate(self, text: str, *, num_steps: int = 4,
@@ -188,17 +202,24 @@ class DotsStreamServer:
         self._intake.put(("req", seq_id, text, dict(
             num_steps=num_steps, guidance_scale=guidance_scale,
             eos_threshold=eos_threshold, max_patches=max_patches, stream=stream)))
+        finished = False
         try:
             while True:
                 kind, data = await q.get()
                 if kind == "done":
+                    finished = True
                     return
                 if kind == "error":
+                    finished = True
                     raise RuntimeError(f"generation failed: {data}") from data
                 yield data
         finally:
             with self._lock:
                 self._subs.pop(seq_id, None)
+            if not finished:
+                # client disconnected / cancelled mid-stream: tell the engine to
+                # abort the seq so it doesn't run to completion holding a slot.
+                self._intake.put(("_cancel", seq_id))
 
     async def generate_wav(self, text: str, **kw) -> torch.Tensor:
         """Non-streaming: the full waveform (one-shot vocode, high throughput)."""
