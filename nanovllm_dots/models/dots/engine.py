@@ -69,6 +69,8 @@ class DotsSeqState:
     pe_row: int | None = None         # cache row in the shared FlashPatchEncoder
     vocoder_state: Any = None         # per-seq BigVGAN streaming state (lazy)
     vocoded: int = 0                  # # of emitted patches already vocoded
+    stream: bool = True               # True: per-patch streaming vocode; False:
+                                      # one-shot vocode the full latents at finish
 
 
 class DotsBatchEngine:
@@ -319,6 +321,7 @@ class DotsBatchEngine:
         guidance_scale: float = 1.2,
         eos_threshold: float = 0.8,
         max_patches: int | None = None,
+        stream: bool = True,
     ) -> None:
         inputs = self.runtime._prepare_inputs(
             text=text, prompt_audio_path=None, prompt_text=None,
@@ -364,6 +367,7 @@ class DotsBatchEngine:
             guidance_scale=guidance_scale,
             eos_threshold=eos_threshold,
             max_patches=max_patches,
+            stream=stream,
         )
         # KV hash tokens = the actual prefill token ids (enables prefix caching
         # across requests with identical text prefixes).
@@ -741,11 +745,14 @@ class DotsBatchEngine:
 
     # ----------------------------------------------------------- streaming run
     @torch.no_grad()
-    def step_stream(self) -> list[tuple[str, str, torch.Tensor | None]]:
+    def step_stream(self, *, vocode: bool = True) -> list[tuple[str, str, torch.Tensor | None]]:
         """One scheduler step; vocode any newly-emitted patches and flush finished
         sequences. Returns events: (seq_id, "audio", wav_chunk) per produced chunk
         and (seq_id, "done", None) when a sequence finishes. This is the primitive
-        the async server loop drives, interleaving add_request between calls."""
+        the async server loop drives, interleaving add_request between calls.
+        `vocode=False` emits silent chunks of the right length (profiling: isolates
+        the vocoder cost from the LLM/FM/patch_encoder stepping)."""
+        hop = self.dots.hop_size * self.core.latent_patch_size
         seqs = self.step()
         if not seqs and not self.scheduler.is_finished():
             raise RuntimeError("scheduler made no progress with pending requests "
@@ -753,15 +760,29 @@ class DotsBatchEngine:
         events: list[tuple[str, str, torch.Tensor | None]] = []
         for seq in seqs:
             st: DotsSeqState = seq.custom_payload
-            while st.vocoded < len(st.latents):
-                chunk = self._vocode_stream_step(st, st.latents[st.vocoded])
-                st.vocoded += 1
-                if chunk.numel():
-                    events.append((seq.seq_id, "audio", chunk))
-            if seq.stoped:
-                final = self._vocode_flush(st)
-                if final.numel():
-                    events.append((seq.seq_id, "audio", final))
+            if st.stream:
+                # low-latency: vocode each patch as it lands (per-4-frame stream_step)
+                while st.vocoded < len(st.latents):
+                    chunk = (self._vocode_stream_step(st, st.latents[st.vocoded])
+                             if vocode else torch.zeros(hop))
+                    st.vocoded += 1
+                    if chunk.numel():
+                        events.append((seq.seq_id, "audio", chunk))
+                if seq.stoped:
+                    final = self._vocode_flush(st)
+                    if final.numel():
+                        events.append((seq.seq_id, "audio", final))
+                    events.append((seq.seq_id, "done", None))
+            elif seq.stoped:
+                # throughput: one-shot vocode the whole utterance at the end (the
+                # streaming decoder's per-chunk context recompute is ~11x costlier)
+                if vocode:
+                    lat = torch.cat(st.latents, dim=1) if st.latents else None
+                    wav = self.vocode(lat) if lat is not None else torch.zeros(0)
+                else:
+                    wav = torch.zeros(hop * len(st.latents))
+                if wav.numel():
+                    events.append((seq.seq_id, "audio", wav))
                 events.append((seq.seq_id, "done", None))
         return events
 
