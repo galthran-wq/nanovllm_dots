@@ -67,6 +67,8 @@ class DotsSeqState:
     max_patches: int | None = None    # hard cap on emitted patches (benchmarking)
     fm_head: Any = None               # per-seq CachedFMHead (fm_accel="kvcache")
     pe_row: int | None = None         # cache row in the shared FlashPatchEncoder
+    vocoder_state: Any = None         # per-seq BigVGAN streaming state (lazy)
+    vocoded: int = 0                  # # of emitted patches already vocoded
 
 
 class DotsBatchEngine:
@@ -707,3 +709,66 @@ class DotsBatchEngine:
             sid: (torch.cat(lat, dim=1) if lat else torch.zeros((1, 0, 0)))
             for sid, lat in self._results.items()
         }
+
+    # --------------------------------------------------------------- vocoder
+    @torch.no_grad()
+    def vocode(self, latents: torch.Tensor) -> torch.Tensor:
+        """One-shot latents [1, frames, latent_dim] -> wav [samples] (48 kHz).
+        Mirrors the reference `_decode_latents` (do_sample=False)."""
+        if latents.numel() == 0:
+            return torch.zeros(0)
+        wav = self.dots._decode_latents(latents.to(self.device))  # [1,1,samples]
+        return wav.detach().float().cpu().reshape(-1)
+
+    @torch.no_grad()
+    def _vocode_stream_step(self, st: DotsSeqState, patch_cpu: torch.Tensor) -> torch.Tensor:
+        """Stream ONE emitted patch [1, patch_size, latent_dim] through BigVGAN's
+        streaming decoder (chunk_size == latent_patch_size, so 1 patch == 1 step)."""
+        if st.vocoder_state is None:
+            st.vocoder_state = self.dots._init_vocoder_stream_state()
+        # _stream_vocoder_patch expects frames-first [1, ps, latent_dim] (same layout
+        # as our stored latents) and transposes to [1, latent_dim, ps] internally.
+        lat = patch_cpu.to(self.device)
+        chunk = self.dots._stream_vocoder_patch(lat, stream_state=st.vocoder_state)
+        return chunk.detach().float().cpu().reshape(-1)
+
+    @torch.no_grad()
+    def _vocode_flush(self, st: DotsSeqState) -> torch.Tensor:
+        if st.vocoder_state is None:
+            return torch.zeros(0)
+        final = self.dots._flush_vocoder_stream(st.vocoder_state)
+        return final.detach().float().cpu().reshape(-1)
+
+    # ----------------------------------------------------------- streaming run
+    @torch.no_grad()
+    def step_stream(self) -> list[tuple[str, str, torch.Tensor | None]]:
+        """One scheduler step; vocode any newly-emitted patches and flush finished
+        sequences. Returns events: (seq_id, "audio", wav_chunk) per produced chunk
+        and (seq_id, "done", None) when a sequence finishes. This is the primitive
+        the async server loop drives, interleaving add_request between calls."""
+        seqs = self.step()
+        if not seqs and not self.scheduler.is_finished():
+            raise RuntimeError("scheduler made no progress with pending requests "
+                               "(KV exhaustion / preemption livelock).")
+        events: list[tuple[str, str, torch.Tensor | None]] = []
+        for seq in seqs:
+            st: DotsSeqState = seq.custom_payload
+            while st.vocoded < len(st.latents):
+                chunk = self._vocode_stream_step(st, st.latents[st.vocoded])
+                st.vocoded += 1
+                if chunk.numel():
+                    events.append((seq.seq_id, "audio", chunk))
+            if seq.stoped:
+                final = self._vocode_flush(st)
+                if final.numel():
+                    events.append((seq.seq_id, "audio", final))
+                events.append((seq.seq_id, "done", None))
+        return events
+
+    @torch.no_grad()
+    def generate_stream(self) -> "Iterator[tuple[str, str, torch.Tensor | None]]":
+        """Offline driver: run all queued requests to completion, yielding streaming
+        events as they are produced (a thin wrapper over step_stream)."""
+        while not self.scheduler.is_finished():
+            for ev in self.step_stream():        # prefill steps just yield nothing
+                yield ev
