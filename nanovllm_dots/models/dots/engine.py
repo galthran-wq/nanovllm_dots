@@ -395,10 +395,14 @@ class DotsBatchEngine:
             if not self._pe_free:
                 raise RuntimeError("flash_pe: row pool exhausted (voice-clone prefill)")
             pe_row = self._pe_free.pop()
-            self._flash_pe.reset_rows(
-                torch.tensor([pe_row], device=self.device, dtype=torch.int32))
-            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                prompt_patch_emb = self._flash_pe.prefill(cond.prompt_latents, pe_row)
+            try:
+                self._flash_pe.reset_rows(
+                    torch.tensor([pe_row], device=self.device, dtype=torch.int32))
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    prompt_patch_emb = self._flash_pe.prefill(cond.prompt_latents, pe_row)
+            except Exception:
+                self._pe_free.append(pe_row)      # don't leak the row on failure
+                raise
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             prefill_embed = self.dots._build_prefill_inputs_embeds(
@@ -424,15 +428,12 @@ class DotsBatchEngine:
             prompt_patches=prompt_patches if use_prefill else None,
             prompt_span_positions=prompt_span_positions if use_prefill else None,
         )
-        # KV hash tokens: text positions by token id; prompt-audio span positions by
-        # the prompt LATENT BYTES (content-addressed) so prefix caching can't falsely
-        # share KV across different reference voices at the same placeholder token id.
         token_ids = schedule[0, :prefill_end].tolist()
-        if use_prefill:
-            for i, pos in enumerate(prompt_span_positions.tolist()):
-                if pos < prefill_end:
-                    token_ids[pos] = prompt_patches[0, i].reshape(-1).float().cpu().numpy().tobytes()
         seq = Sequence(seq_id, token_ids, self.block_size, payload)
+        # clone prefill cannot reuse cached KV: the prompt-audio spans aren't
+        # token-id-addressable and the FM seeding needs the FULL prefill hiddens.
+        if use_prefill:
+            seq.disable_cache = True
         self._results[seq_id] = payload.latents
         self.scheduler.add(seq)
 

@@ -128,12 +128,20 @@ class BlockManager:
         assert not seq.block_table
         h = -1
         cache_miss = False
+        # Sequences may opt out of prefix-cache reuse (e.g. voice-clone prefill,
+        # whose KV cannot be reconstructed from a partial prefix and whose audio
+        # spans aren't token-id-addressable): force a full, uncached prefill.
+        no_cache = getattr(seq, "disable_cache", False)
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if no_cache:
+                h = -1
                 cache_miss = True
+            else:
+                h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+                block_id = self.hash_to_block_id.get(h, -1)
+                if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                    cache_miss = True
             if cache_miss:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
