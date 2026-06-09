@@ -53,6 +53,7 @@ def main() -> None:
     ap.add_argument("--model", default="models/dots.tts-mf")
     ap.add_argument("--num-steps", type=int, default=4)
     ap.add_argument("--fm-accel", default="cudagraph")
+    ap.add_argument("--graph-decode", action="store_true")
     ap.add_argument("--text-repeat", type=int, default=1)
     args = ap.parse_args()
 
@@ -91,7 +92,7 @@ def main() -> None:
         eng = DotsBatchEngine(
             runtime, paged, model_dir=args.model, num_kvcache_blocks=256,
             block_size=256, max_num_seqs=8, fm_accel=args.fm_accel,
-            fm_vfp=shared_vfp, fm_len_bucket=0,
+            fm_vfp=shared_vfp, fm_len_bucket=0, graph_decode=args.graph_decode,
         )
         text = " ".join([EN1] * args.text_repeat)
         eng.add_request("r0", text, num_steps=args.num_steps, guidance_scale=1.2)

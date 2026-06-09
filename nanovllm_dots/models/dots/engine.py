@@ -88,6 +88,7 @@ class DotsBatchEngine:
         hybrid_threshold: int = 400,   # fm_seq_len to switch cudagraph-full -> kvcache
                                        # (~per-patch crossover; clean bench: kvcache
                                        # already wins by L~250/16s, cudagraph by L~105/3.5s)
+        graph_decode: bool = False,    # CUDA-graph the one-token LLM decode forward
     ) -> None:
         self.kvcache_graphed = kvcache_graphed
         self.hybrid_threshold = hybrid_threshold
@@ -159,8 +160,17 @@ class DotsBatchEngine:
 
         self.batched_llm = BatchedPagedLLM(
             paged_llm, num_blocks=num_kvcache_blocks, block_size=block_size,
-            device=self.device, dtype=self.dtype,
+            device=self.device, dtype=self.dtype, graph_decode=graph_decode,
         )
+        if graph_decode:
+            # Capture now, while the paged cache holds no live sequence (the
+            # decode graph writes K/V into it at the captured slots). Covers
+            # every co-active batch size the scheduler can form. The block-table
+            # width is sized to the longest sequence (ceil(max_model_len/block))
+            # so the graph -- not the eager fallback -- serves every real length.
+            bt_width = -(-max_model_len // block_size)
+            self.batched_llm.warmup_decode(
+                batch_sizes=tuple(range(1, max_num_seqs + 1)), bt_width=bt_width)
         cfg = Config(
             model=model_dir,
             max_num_seqs=max_num_seqs,
