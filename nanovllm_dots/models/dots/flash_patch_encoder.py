@@ -70,6 +70,37 @@ class FlashPatchEncoder:
             k[rows] = 0; v[rows] = 0
 
     @torch.no_grad()
+    def prefill(self, prompt_latents: torch.Tensor, row: int) -> torch.Tensor:
+        """Seed cache `row` with a whole prompt utterance in ONE pass (voice cloning).
+        Mirrors VAESemanticEncoder.prefill (full causal-conv downsample + encoder over
+        all prompt tokens from an empty cache) but with flash attention, leaving the
+        row's K/V + conv_tail + seqlen ready for subsequent decode_patch. Returns the
+        prompt patch embeddings [1, P, out_dim] for the LLM prefill. `prompt_latents`
+        is [1, frames, latent_dim] (sampled/denormalized, as the reference passes)."""
+        pe = self.pe
+        x = prompt_latents.to(self.dtype)
+        step_inputs = pe.in_proj(pe._downsample(x))            # [1, T, hidden]
+        T = step_inputs.size(1)
+        if T > self.cap:
+            raise RuntimeError(f"prompt encoder tokens {T} exceed capacity {self.cap}")
+        raw = x.transpose(1, 2)                                # [1, in_ch, frames]
+        self.conv_tail[row] = raw[..., -pe.ds_proj.left_padding:]
+        h = step_inputs
+        pos = torch.arange(T, device=self.device, dtype=torch.long).unsqueeze(0)  # [1,T]
+        seqlens0 = torch.zeros(1, device=self.device, dtype=torch.int32)
+        rows1 = torch.tensor([row], device=self.device, dtype=torch.int32)
+        for l, layer in enumerate(self.layers):
+            attn = layer.attn
+            q, k, v = _project_qkv_flash(attn, layer.attn_norm(h), pos)
+            o = flash_attn_with_kvcache(
+                q, self.kbuf[l], self.vbuf[l], k=k, v=v,
+                cache_seqlens=seqlens0, cache_batch_idx=rows1, causal=True)
+            h = h + _o_proj_flash(attn, o)
+            h = h + layer.ffn(layer.ffn_norm(h))
+        self.seqlens[row] = T
+        return pe._project_embeddings(h)                       # [1, P, out_dim]
+
+    @torch.no_grad()
     def decode_patch(self, latent_patches: torch.Tensor,
                      rows: torch.Tensor) -> torch.Tensor:
         """latent_patches: [n, patch_size, latent_dim] (denormalized, as fed to the

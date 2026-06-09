@@ -71,6 +71,10 @@ class DotsSeqState:
     vocoded: int = 0                  # # of emitted patches already vocoded
     stream: bool = True               # True: per-patch streaming vocode; False:
                                       # one-shot vocode the full latents at finish
+    # voice cloning step B (in-context prompt prefill)
+    prompt_patches: torch.Tensor | None = None      # [1, P, ps, ld] normalized
+    prompt_span_positions: torch.Tensor | None = None  # schedule positions of prompt
+    fm_seeded: bool = False           # FM history seeded from the prompt prefill
 
 
 class DotsBatchEngine:
@@ -279,12 +283,14 @@ class DotsBatchEngine:
                         pos_ids=pos.expand(bs, -1).contiguous(),
                         g_cond=torch.zeros(bs, H, device=dev, dtype=dt),
                     )
-    def _alloc_private_state(self, span_count: int):
-        """dots `_GenerateState` with PRIVATE FM buffers (not the shared cache)."""
+    def _alloc_private_state(self, span_count: int, prompt_patch_count: int = 0):
+        """dots `_GenerateState` with PRIVATE FM buffers (not the shared cache).
+        prompt_patch_count (voice cloning) extends the FM history capacity to hold the
+        prefilled prompt patches in front of the generated ones."""
         from dots_tts.models.dots_tts.model import _GenerateState
 
         core = self.core
-        patch_count = self.dots._resolve_state_audio_patch_count(span_count)
+        patch_count = self.dots._resolve_state_audio_patch_count(span_count) + prompt_patch_count
         # flash_pe shares a fixed-capacity history cache (cap = pe_max_patches *
         # out_ds_rate). Bound each request's emitted patches here (host-side, no
         # per-step GPU sync) so flash_attn_with_kvcache can never write past the
@@ -323,20 +329,35 @@ class DotsBatchEngine:
         max_patches: int | None = None,
         stream: bool = True,
         prompt_audio_path: str | None = None,
+        prompt_text: str | None = None,
         speaker_scale: float = 1.5,
+        clone_prefill: bool = True,
     ) -> None:
-        # Voice cloning step A: speaker conditioning (g_cond). The reference audio's
-        # x-vector -> core.xvec_proj -> g_cond steers the FM head toward that timbre.
-        # (Step B will additionally prefill the prompt audio in-context.)
+        # Voice cloning. (A) g_cond: the reference audio's x-vector -> core.xvec_proj
+        # steers the FM head toward that timbre. (B) clone_prefill: additionally
+        # prefill the prompt audio IN-CONTEXT (prompt patches seed the patch_encoder
+        # cache + LLM KV + FM history), the stronger reference-following path.
+        use_prefill = prompt_audio_path is not None and clone_prefill
         g_cond = None
+        prompt_patches = None
+        prompt_patch_count = 0
+        cond = None
         if prompt_audio_path is not None:
             prompt_audio = self.runtime._load_prompt_audio(prompt_audio_path).to(self.device)
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 cond = self.dots._prepare_prompt_conditioning(
-                    prompt_audio, use_prompt_prefill=False, speaker_scale=speaker_scale)
+                    prompt_audio, use_prompt_prefill=use_prefill, speaker_scale=speaker_scale)
             g_cond = cond.g_cond                      # [1, fm_hidden_size]
+            if use_prefill:
+                if not self.flash_pe:
+                    raise NotImplementedError("voice-clone prefill requires flash_pe")
+                prompt_patches = cond.prompt_patches  # [1, P, ps, ld] normalized
+                prompt_patch_count = int(prompt_patches.size(1))
+
         inputs = self.runtime._prepare_inputs(
-            text=text, prompt_audio_path=None, prompt_text=None,
+            text=text,
+            prompt_audio_path=prompt_audio_path if use_prefill else None,
+            prompt_text=prompt_text if use_prefill else None,
             template_name=None, language=None, normalize_text=False,
         )
         schedule = inputs["generation_schedule"].to(self.device)
@@ -346,27 +367,46 @@ class DotsBatchEngine:
         span_positions = self.dots._find_audio_span_positions(
             schedule, audio_placeholder_ids=self._audio_ids
         )
-        span_count = int(span_positions.numel())
-        if span_count < 1:
-            raise ValueError("schedule has no audio spans to generate")
-        # Phase-1 scope: only the default contiguous-audio template (a single run
-        # of spans after the prefix). Interleaved templates weave text tokens
-        # between spans and need _consume_text_schedule handling we don't do yet.
-        if span_count > 1 and int(span_positions[-1] - span_positions[0]) != span_count - 1:
+        total_spans = int(span_positions.numel())
+        if total_spans <= prompt_patch_count:
+            raise ValueError("schedule has no target audio spans to generate")
+        span_count = total_spans - prompt_patch_count          # TARGET spans
+        target_spans = span_positions[prompt_patch_count:]
+        # only contiguous-audio TARGET templates (interleaved need text-schedule weave)
+        if span_count > 1 and int(target_spans[-1] - target_spans[0]) != span_count - 1:
             raise NotImplementedError(
                 "DotsBatchEngine supports only contiguous-audio (non-interleave) "
-                "templates in Phase 1; got interleaved audio spans."
-            )
-        prefill_end = int(span_positions[0].item())  # no prompt audio => first span
+                "target templates; got interleaved audio spans.")
+
+        if use_prefill:
+            prefill_end, prompt_span_positions = self.dots._locate_prefill_boundary(
+                span_positions=span_positions, prompt_patch_count=prompt_patch_count)
+        else:
+            prefill_end = int(span_positions[0].item())
+            prompt_span_positions = span_positions[:0]
+
+        state = self._alloc_private_state(span_count, prompt_patch_count)
+
+        # flash_pe prompt prefill: seed this seq's encoder-cache row with the whole
+        # prompt and get the prompt patch embeddings for the LLM prefill.
+        pe_row = None
+        prompt_patch_emb = None
+        if use_prefill:
+            if not self._pe_free:
+                raise RuntimeError("flash_pe: row pool exhausted (voice-clone prefill)")
+            pe_row = self._pe_free.pop()
+            self._flash_pe.reset_rows(
+                torch.tensor([pe_row], device=self.device, dtype=torch.int32))
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                prompt_patch_emb = self._flash_pe.prefill(cond.prompt_latents, pe_row)
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             prefill_embed = self.dots._build_prefill_inputs_embeds(
                 schedule[:, :prefill_end],
-                prompt_patch_embeddings=None,
-                prompt_span_positions=span_positions[:0],
+                prompt_patch_embeddings=prompt_patch_emb,
+                prompt_span_positions=prompt_span_positions,
             )[0]  # [prefill_end, H]
 
-        state = self._alloc_private_state(span_count)
         payload = DotsSeqState(
             schedule=schedule,
             prefill_end=prefill_end,
@@ -380,13 +420,41 @@ class DotsBatchEngine:
             eos_threshold=eos_threshold,
             max_patches=max_patches,
             stream=stream,
+            pe_row=pe_row,
+            prompt_patches=prompt_patches if use_prefill else None,
+            prompt_span_positions=prompt_span_positions if use_prefill else None,
         )
-        # KV hash tokens = the actual prefill token ids (enables prefix caching
-        # across requests with identical text prefixes).
+        # KV hash tokens: text positions by token id; prompt-audio span positions by
+        # the prompt LATENT BYTES (content-addressed) so prefix caching can't falsely
+        # share KV across different reference voices at the same placeholder token id.
         token_ids = schedule[0, :prefill_end].tolist()
+        if use_prefill:
+            for i, pos in enumerate(prompt_span_positions.tolist()):
+                if pos < prefill_end:
+                    token_ids[pos] = prompt_patches[0, i].reshape(-1).float().cpu().numpy().tobytes()
         seq = Sequence(seq_id, token_ids, self.block_size, payload)
         self._results[seq_id] = payload.latents
         self.scheduler.add(seq)
+
+    def _seed_prefill_fm(self, state, hidden_b: torch.Tensor, p: DotsSeqState) -> None:
+        """Seed the FM history from a voice-clone prompt prefill (replicates the
+        reference `_prefill` interleave): for each prompt span, append the preceding
+        LLM hidden (if any gap), the prompt latent, and the span's own hidden; then
+        the final hidden that seeds target patch 0. `hidden_b` is [1, prefill_end, H]
+        (the full prefill hiddens)."""
+        dots = self.dots
+        cursor = 0
+        for i, sp in enumerate(p.prompt_span_positions.tolist()):
+            if sp > cursor:
+                dots._append_hidden_chunk(state, hidden_b[:, sp - 1:sp, :])
+            dots._append_history_chunk(state, p.prompt_patches[:, i])
+            if dots._next_token_is_audio_span(
+                    p.schedule, position=sp, audio_placeholder_ids=self._audio_ids):
+                dots._append_hidden_chunk(state, hidden_b[:, sp:sp + 1, :])
+            cursor = sp + 1
+        if p.prefill_end > cursor:
+            dots._append_hidden_chunk(state, hidden_b[:, p.prefill_end - 1:p.prefill_end, :])
+        state.llm_hiddens = hidden_b[:, -1:, :]
 
     def cancel(self, seq_id: str) -> bool:
         """Abort an in-flight request: free its KV blocks and flash_pe cache row and
@@ -446,12 +514,23 @@ class DotsBatchEngine:
             # 2) pre-FM (per seq, cheap): seed/append the hidden chunk, eos check.
             stops = []
             for seq, hidden in zip(seqs, hiddens):
-                state = seq.custom_payload.gen_state
-                state.llm_hiddens = hidden[-1:].unsqueeze(0)  # [1, 1, H]
-                dots._append_hidden_chunk(state, state.llm_hiddens)
+                p = seq.custom_payload
+                state = p.gen_state
+                if is_prefill and p.prompt_patches is not None and not p.fm_seeded:
+                    # voice-clone prompt prefill: the FULL prefill hiddens seed the FM
+                    # history interleaved with the prompt latents.
+                    if seq.num_cached_tokens != 0:
+                        raise RuntimeError(
+                            f"seq {seq.seq_id}: voice-clone prefill needs the full "
+                            "prefill (got a partial prefix-cache hit).")
+                    self._seed_prefill_fm(state, hidden.unsqueeze(0), p)
+                    p.fm_seeded = True
+                else:
+                    state.llm_hiddens = hidden[-1:].unsqueeze(0)  # [1, 1, H]
+                    dots._append_hidden_chunk(state, state.llm_hiddens)
                 stops.append(
                     dots._should_stop_after_current_audio(
-                        state, eos_threshold=seq.custom_payload.eos_threshold
+                        state, eos_threshold=p.eos_threshold
                     )
                 )
 
