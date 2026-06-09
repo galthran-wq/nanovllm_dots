@@ -125,7 +125,7 @@ class DotsBatchEngine:
             self._vfp_full = fm_vfp if fm_vfp is not None else CudaGraphRunner(
                 self.core.velocity_field_predictor)
             self._vfp = self.core.velocity_field_predictor
-        elif fm_vfp is not None:
+        elif fm_vfp is not None and fm_accel != "mfgraph":
             self._vfp = fm_vfp
         elif fm_accel == "cudagraph":
             # Manual CUDA-graph capture of the EAGER DiT (faithful to eager: the
@@ -156,6 +156,18 @@ class DotsBatchEngine:
             # per-seq CachedFMHead objects (built lazily in _kvcache_fm) that capture
             # their own graphs of the eager DiT layers. self._vfp is that eager DiT.
             self._vfp = self.core.velocity_field_predictor
+        elif fm_accel == "mfgraph":
+            # MeanFlow whole-patch graph: capture the entire nfe-step solver into
+            # one graph (built lazily in _mf_graph once the nfe is known). The DiT
+            # must be capture-safe (arange().to() in the embedders aborts capture).
+            from nanovllm_dots.models.dots.cudagraph_dit import make_dit_capture_safe
+            make_dit_capture_safe(self.core.velocity_field_predictor, self.device)
+            self._vfp = self.core.velocity_field_predictor
+            # A shared GraphedMeanflow (via fm_vfp) POOLS the whole-patch graphs
+            # across engines/requests -- essential, since each history length is
+            # captured once and the capture is ~4x a single-DiT graph; reuse only
+            # pays off across requests of recurring lengths. None -> built lazily.
+            self._mfgraph = fm_vfp
         else:
             self._vfp = self.core.velocity_field_predictor
 
@@ -443,8 +455,10 @@ class DotsBatchEngine:
             if self.fm_accel in ("kvcache", "hybrid"):
                 raise RuntimeError(
                     f"fm_accel={self.fm_accel!r} not yet supported for MeanFlow "
-                    "(dots.tts-mf); use 'none', 'compile', or 'cudagraph'."
+                    "(dots.tts-mf); use 'none', 'compile', 'cudagraph', or 'mfgraph'."
                 )
+            if self.fm_accel == "mfgraph":
+                return self._mf_graph(payloads)
             return self._full_fm(payloads, self._vfp)
         if self.fm_accel == "kvcache":
             return self._kvcache_fm(payloads)
@@ -452,14 +466,14 @@ class DotsBatchEngine:
             return self._hybrid_fm(payloads)
         return self._full_fm(payloads, self._vfp)
 
-    def _full_fm(self, payloads: list[DotsSeqState], vfp) -> torch.Tensor:
-        """Pad every active sequence's FM history into one batch and integrate the
-        CFG ODE together through `vfp` (eager / compiled / cudagraph-full)."""
-        from nanovllm_dots.models.dots.batched_fm import (
-            batched_flow_matching, batched_meanflow,
-        )
-        meanflow = getattr(self.core, "mode", "flow_matching") == "meanflow"
+    def _pack_fm_inputs(self, payloads: list[DotsSeqState]):
+        """Pad every active sequence's FM history into one batch.
 
+        Returns (inp, cfg, mask, pos, gcond, p0, meanflow). `cfg` (the CFG uncond
+        sequence) is None for MeanFlow. The padding gap is self-masked and rotary
+        positions stay per-seq correct, so the padded batch == running each alone.
+        """
+        meanflow = getattr(self.core, "mode", "flow_matching") == "meanflow"
         core, dots = self.core, self.dots
         states = [p.gen_state for p in payloads]
         n = len(states)
@@ -469,12 +483,10 @@ class DotsBatchEngine:
         if self.fm_len_bucket > 0:
             b = self.fm_len_bucket
             max_len = ((max_len + b - 1) // b) * b
-        # One odeint call integrates the whole batch, so the ODE schedule and CFG
-        # must be uniform across co-active requests. Fail loud rather than silently
-        # decode some requests with the wrong NFE/guidance.
+        # A single batched integration shares the ODE schedule (and, for FM, CFG),
+        # so those must be uniform across co-active requests. Fail loud rather than
+        # silently decode some requests with the wrong NFE/guidance.
         p0 = payloads[0]
-        # MeanFlow has no CFG; only the step count must be uniform across the
-        # co-active batch. Flow-matching additionally pins guidance/ode_method.
         for p in payloads:
             mism = (p.num_steps != p0.num_steps) if meanflow else (
                 (p.num_steps, p.guidance_scale, p.ode_method)
@@ -501,15 +513,22 @@ class DotsBatchEngine:
             inp[i, :L] = st.fm_sequence[0, :L]
             if not meanflow:
                 cfg[i, :L] = st.fm_cfg_sequence[0, :L]
-            # _build_fm_* fill a [1, total_len, ...] view in place (zero + structure);
-            # padding gap [L:max_len] is self-masked, positions stay per-seq correct.
             dots._build_fm_attn_mask(state=st, attn_mask=mask[i : i + 1])
             dots._build_fm_pos_ids(state=st, pos_ids=pos[i : i + 1])
             if p.g_cond is not None:
                 gcond[i] = p.g_cond.to(dev, dt)
             elif st.fm_null_g_cond is not None:
                 gcond[i] = st.fm_null_g_cond[0]
+        return inp, cfg, mask, pos, gcond, p0, meanflow
 
+    def _full_fm(self, payloads: list[DotsSeqState], vfp) -> torch.Tensor:
+        """Pad every active sequence's FM history into one batch and integrate the
+        ODE together through `vfp` (eager / compiled / cudagraph-full)."""
+        from nanovllm_dots.models.dots.batched_fm import (
+            batched_flow_matching, batched_meanflow,
+        )
+        core = self.core
+        inp, cfg, mask, pos, gcond, p0, meanflow = self._pack_fm_inputs(payloads)
         if meanflow:
             # guidance_scale / ode_method are intentionally dropped: MeanFlow
             # distills CFG in and uses a fixed explicit-Euler few-step integrator.
@@ -521,6 +540,20 @@ class DotsBatchEngine:
             core, input_sequence=inp, cfg_sequence=cfg, attn_mask=mask, pos_ids=pos,
             g_cond=gcond, num_steps=p0.num_steps, guidance_scale=p0.guidance_scale,
             ode_method=p0.ode_method, vfp=vfp,
+        )
+
+    def _mf_graph(self, payloads: list[DotsSeqState]) -> torch.Tensor:
+        """Whole-patch MeanFlow: ONE CUDA graph captures the entire nfe-step solver
+        (coordinate_proj + clones + DiT + z-update), so a patch is one replay
+        instead of nfe replays glued by eager kernels."""
+        inp, _, mask, pos, gcond, p0, _ = self._pack_fm_inputs(payloads)
+        if self._mfgraph is None:
+            from nanovllm_dots.models.dots.graphed_meanflow import GraphedMeanflow
+            self._mfgraph = GraphedMeanflow(
+                self.core, num_steps=p0.num_steps, dit=self._vfp)
+        return self._mfgraph(
+            input_sequence=inp, attn_mask=mask, pos_ids=pos,
+            g_cond=gcond, num_steps=p0.num_steps,
         )
 
     def _finish_patch(self, seq: Sequence, st: DotsSeqState, patch: torch.Tensor, stop: bool) -> None:

@@ -43,7 +43,7 @@ def main() -> None:
                     help="stop after exactly N patches (eos off) -> identical length all accels")
     ap.add_argument("--no-compile", action="store_true", help="disable FM torch.compile")
     ap.add_argument("--fm-accel", default=None,
-                    choices=["none", "compile", "cudagraph", "kvcache", "hybrid"],
+                    choices=["none", "compile", "cudagraph", "kvcache", "hybrid", "mfgraph"],
                     help="FM acceleration (overrides --no-compile)")
     ap.add_argument("--graph-decode", action="store_true",
                     help="CUDA-graph the one-token LLM decode forward")
@@ -88,6 +88,14 @@ def main() -> None:
         from nanovllm_dots.models.dots.cudagraph_dit import CudaGraphRunner, make_dit_capture_safe
         make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
         shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
+    elif fm_accel == "mfgraph":
+        # Share ONE GraphedMeanflow so the whole-patch graphs (one per history
+        # length, captured once) persist across the warmup/measure run_batch.
+        from nanovllm_dots.models.dots.cudagraph_dit import make_dit_capture_safe
+        from nanovllm_dots.models.dots.graphed_meanflow import GraphedMeanflow
+        make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
+        shared_vfp = GraphedMeanflow(runtime.model.core, num_steps=args.num_steps,
+                                     dit=runtime.model.core.velocity_field_predictor)
     else:
         # kvcache builds per-seq CachedFMHead internally; none => eager DiT.
         shared_vfp = None
