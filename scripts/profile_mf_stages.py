@@ -54,6 +54,8 @@ def main() -> None:
     ap.add_argument("--num-steps", type=int, default=4)
     ap.add_argument("--fm-accel", default="cudagraph")
     ap.add_argument("--graph-decode", action="store_true")
+    ap.add_argument("--compile-pe", action="store_true",
+                    help="torch.compile the patch_encoder decode_patch (static shapes)")
     ap.add_argument("--text-repeat", type=int, default=1)
     args = ap.parse_args()
 
@@ -87,6 +89,9 @@ def main() -> None:
     if args.fm_accel == "cudagraph":
         make_dit_capture_safe(runtime.model.core.velocity_field_predictor, torch.device("cuda"))
         shared_vfp = CudaGraphRunner(runtime.model.core.velocity_field_predictor)
+    if args.compile_pe:
+        pe = runtime.model.core.patch_encoder
+        pe.decode_patch = torch.compile(pe.decode_patch, dynamic=False)
 
     def build():
         eng = DotsBatchEngine(

@@ -47,6 +47,8 @@ def main() -> None:
                     help="FM acceleration (overrides --no-compile)")
     ap.add_argument("--graph-decode", action="store_true",
                     help="CUDA-graph the one-token LLM decode forward")
+    ap.add_argument("--compile-pe", action="store_true",
+                    help="torch.compile the patch_encoder decode_patch")
     args = ap.parse_args()
     levels = [int(x) for x in args.concurrency.split(",")]
 
@@ -95,7 +97,7 @@ def main() -> None:
             runtime, paged, model_dir=args.model,
             num_kvcache_blocks=256, block_size=256, max_num_seqs=max(n, 8),
             fm_accel=fm_accel, fm_vfp=shared_vfp, fm_len_bucket=0,
-            graph_decode=args.graph_decode,
+            graph_decode=args.graph_decode, compile_pe=args.compile_pe,
         )
         texts = ([EN1, ZH1] * ((n + 1) // 2))[:n]
         texts = [" ".join([t] * args.text_repeat) for t in texts]

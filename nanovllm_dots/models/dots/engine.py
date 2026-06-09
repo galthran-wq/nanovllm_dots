@@ -89,6 +89,7 @@ class DotsBatchEngine:
                                        # (~per-patch crossover; clean bench: kvcache
                                        # already wins by L~250/16s, cudagraph by L~105/3.5s)
         graph_decode: bool = False,    # CUDA-graph the one-token LLM decode forward
+        compile_pe: bool = False,      # torch.compile the patch_encoder decode_patch
     ) -> None:
         self.kvcache_graphed = kvcache_graphed
         self.hybrid_threshold = hybrid_threshold
@@ -157,6 +158,16 @@ class DotsBatchEngine:
             self._vfp = self.core.velocity_field_predictor
         else:
             self._vfp = self.core.velocity_field_predictor
+
+        # patch_encoder.decode_patch has fully STATIC shapes (it attends over the
+        # fixed cache_capacity with a positions-derived mask), so a single
+        # torch.compile specialization (dynamic=False) fuses its many tiny eager
+        # kernels -- ~16 -> ~8 ms/patch. Compiled once on the shared core.
+        if compile_pe:
+            pe = self.core.patch_encoder
+            if not getattr(pe, "_decode_patch_compiled", False):
+                pe.decode_patch = torch.compile(pe.decode_patch, dynamic=False)
+                pe._decode_patch_compiled = True
 
         self.batched_llm = BatchedPagedLLM(
             paged_llm, num_blocks=num_kvcache_blocks, block_size=block_size,
