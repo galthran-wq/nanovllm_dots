@@ -53,3 +53,16 @@ torchaudio = { index = "pytorch-cu126" }
 # Prebuilt flash-attn wheel (torch2.8 / cu12 / cp312 / cxx11abiTRUE) -- avoids a
 # multi-hour nvcc compile. From the Dao-AILab v2.8.3 release.
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "advanced: reference-consistency test; needs a CUDA GPU + model weights (auto-skips otherwise)",
+    "legacy: covers a superseded/legacy path (soar model, cached_fm predecessor, compile variants)",
+]
