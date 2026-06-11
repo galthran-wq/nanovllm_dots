@@ -3,11 +3,14 @@
 reference dots.tts implementation in eager mode, with fixed seeds, so the
 optimized engine can be regression-tested against it.
 
+The golden fixtures are committed under tests/golden{,_mf}/; regenerate there.
+
 Usage:
     .venv/bin/python scripts/gen_golden.py \
-        --model rednote-hilab/dots.tts-soar \
-        --out golden/ \
+        --model models/dots.tts-soar --out tests/golden \
         [--prompt-audio ref.wav --prompt-text "..."]
+    .venv/bin/python scripts/gen_golden.py \
+        --model models/dots.tts-mf --out tests/golden_mf
 """
 from __future__ import annotations
 
@@ -38,8 +41,8 @@ PROMPTS = [
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="rednote-hilab/dots.tts-soar")
-    ap.add_argument("--out", default="golden")
+    ap.add_argument("--model", default="models/dots.tts-soar")
+    ap.add_argument("--out", default="tests/golden")
     ap.add_argument("--precision", default="bfloat16")
     ap.add_argument("--num-steps", type=int, default=10)
     ap.add_argument("--guidance-scale", type=float, default=1.2)
