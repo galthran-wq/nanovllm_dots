@@ -39,6 +39,12 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 MF = str(ROOT / "models" / "dots.tts-mf")
 SOAR = str(ROOT / "models" / "dots.tts-soar")
 
+# Committed golden fixtures (reference latents + clone prompt audio), versioned
+# alongside the tests. Regenerate with scripts/gen_golden.py.
+_TESTS_DIR = pathlib.Path(__file__).resolve().parent
+GOLDEN_DIR = str(_TESTS_DIR / "golden")           # soar reference latents/wavs
+GOLDEN_MF_DIR = str(_TESTS_DIR / "golden_mf")     # mf reference latents/wavs
+
 # Reference prompts (same text the golden artifacts + scripts used).
 EN1 = "Hello, this is a reference sample generated for regression testing."
 ZH1 = "这是一个用于回归测试的参考样本。"

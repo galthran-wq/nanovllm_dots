@@ -13,14 +13,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import MF, ROOT, set_seed
+from conftest import GOLDEN_MF_DIR, MF, set_seed
 
 pytestmark = pytest.mark.advanced
 MODEL = MF
 
 TEXT = "Voice cloning conditions the synthesizer on a reference speaker."
-REF_A = os.path.join(str(ROOT), "golden_mf", "en1.wav")
-REF_B = os.path.join(str(ROOT), "golden_mf", "zh1.wav")
+REF_A = os.path.join(GOLDEN_MF_DIR, "en1.wav")
+REF_B = os.path.join(GOLDEN_MF_DIR, "zh1.wav")
 
 
 def _require_refs(*paths):

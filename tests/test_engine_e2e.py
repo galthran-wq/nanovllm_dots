@@ -24,12 +24,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import EN1, ROOT, SOAR, ZH1, set_seed
+from conftest import EN1, GOLDEN_DIR, SOAR, ZH1, set_seed
 
 pytestmark = pytest.mark.advanced
 MODEL = SOAR
 
-GOLDEN_DIR = os.path.join(str(ROOT), "golden")
 PROMPTS = [("en1", EN1), ("zh1", ZH1)]
 NUM_STEPS = 10
 GUIDANCE = 1.2

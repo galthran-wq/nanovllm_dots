@@ -5,11 +5,9 @@
 # so it does NOT match the nanovllm_dots/models/ package dir.
 /models/
 
-# golden reference audio/latents (regenerate via scripts/gen_golden.py); keep manifest
-golden/*.wav
-golden/*.npy
-golden_mf/*.wav
-golden_mf/*.npy
+# golden reference fixtures now live in tests/golden{,_mf}/ and ARE committed
+# (~1.6 MB; the pinned reference baseline for the consistency tests). Regenerate
+# with scripts/gen_golden.py if the model checkpoint changes.
 
 # vendored upstream reference (clone of github.com/rednote-hilab/dots.tts)
 reference/
