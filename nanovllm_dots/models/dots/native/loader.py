@@ -89,3 +89,22 @@ def build_native_patch_encoder(model_dir: str, *, device="cuda",
         torch.set_default_dtype(prev)
     load_component(pe, ckpt, "patch_encoder.")
     return pe
+
+
+def build_native_vocoder(model_dir: str, *, device="cuda", dtype=torch.float32):
+    """Build + load the native BigVGAN AudioVAE vocoder (runs in float32, like the
+    reference). Mirrors the reference build order: construct, remove_weight_norm,
+    then load (the checkpoint was saved after weight-norm folding)."""
+    from .vocoder import AudioVAE, AudioVAEConfig
+    cfg = load_config(model_dir)
+    ckpt = os.path.join(model_dir, "vocoder.safetensors")
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            vocoder = AudioVAE(AudioVAEConfig.from_dict(cfg["vocoder"])).eval()
+        vocoder.remove_weight_norm()
+    finally:
+        torch.set_default_dtype(prev)
+    load_component(vocoder, ckpt, "")
+    return vocoder
