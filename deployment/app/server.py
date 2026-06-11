@@ -57,8 +57,7 @@ class DotsStreamServer:
         # is kernel-dynamic. So after warmup there is no capture in the serving path.
         import torch.distributed as dist
         from transformers import Qwen2Config
-        from dots_tts.models.dots_tts.model import DotsTtsModel  # noqa: F401
-        from dots_tts.runtime import DotsTtsRuntime
+        from nanovllm_dots.models.dots.native.runtime import DotsRuntime
         from nanovllm_dots.models.dots.loader import load_llm_weights
         from nanovllm_dots.models.dots.model_llm import QwenLLM
         from nanovllm_dots.models.dots.engine import DotsBatchEngine
@@ -72,8 +71,9 @@ class DotsStreamServer:
             dist.init_process_group("nccl", rank=0, world_size=1)
         torch.cuda.set_device(0)
 
-        runtime = DotsTtsRuntime.from_pretrained(
-            model_dir, precision="bfloat16", optimize=False, max_generate_length=256)
+        # native model -- no dots_tts at runtime
+        runtime = DotsRuntime.from_pretrained(
+            model_dir, device="cuda", dtype=torch.bfloat16, max_generate_length=256)
         ckpt = os.path.join(model_dir, "model.safetensors")
         cfg = Qwen2Config.from_json_file(os.path.join(model_dir, "llm_config.json"))
         torch.set_default_dtype(torch.bfloat16)

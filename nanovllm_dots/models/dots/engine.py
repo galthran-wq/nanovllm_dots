@@ -287,7 +287,7 @@ class DotsBatchEngine:
         """dots `_GenerateState` with PRIVATE FM buffers (not the shared cache).
         prompt_patch_count (voice cloning) extends the FM history capacity to hold the
         prefilled prompt patches in front of the generated ones."""
-        from dots_tts.models.dots_tts.model import _GenerateState
+        from nanovllm_dots.models.dots.native.model import _GenerateState
 
         core = self.core
         patch_count = self.dots._resolve_state_audio_patch_count(span_count) + prompt_patch_count
