@@ -22,3 +22,6 @@ __pycache__/
 
 # misc
 *.log
+
+# claude code local state
+.claude/
