@@ -79,12 +79,18 @@ Config via env (see `app/core/config.py`): `DOTS_MODEL` (default
 (`compile`|`cudagraph`), `DOTS_FLASH_PE`, `DOTS_GRAPH_DECODE`, `DOTS_WARMUP`,
 `DOTS_HOST`, `DOTS_PORT`.
 
+Needs the NVIDIA Container Toolkit on the host (for `--gpus`).
+
 ### Notes
-- Deps are installed via `uv sync --frozen` from `uv.lock`; the vendored
-  `reference/dots.tts` is then `uv pip install --no-deps`'d (its WeTextProcessing
-  dep is stubbed by `stubs/tn`).
-- The image bakes a prebuilt flash-attn wheel (torch2.8 / cu12 / cp312 / sm_80) —
-  no multi-hour nvcc compile. To target a different GPU/torch, swap the wheel URL
-  in `pyproject.toml` (`[tool.uv.sources]`) and re-run `uv lock`.
-- The `-devel` CUDA base can be slimmed to `-runtime` if no transitive dep needs a
-  source build (flash-attn here is prebuilt and torch bundles its CUDA libs).
+- **No CUDA base image (~13 GB total).** The base is `python:3.12-slim`: the
+  `torch +cu126` wheels bundle their own CUDA runtime (cudnn/cublas/…), flash-attn
+  is a prebuilt wheel, and Triton ships its own `ptxas`, so the only host
+  dependency is the NVIDIA *driver* (injected by `--gpus`). A CUDA base would ship
+  a second, redundant copy of CUDA (it made the image ~36 GB).
+- Deps via `uv sync --frozen --no-cache` from `uv.lock` (`--no-cache` keeps uv's
+  ~7 GB wheel cache out of the image); the vendored `reference/dots.tts` is then
+  `uv pip install --no-deps`'d (its WeTextProcessing dep is stubbed by `stubs/tn`,
+  and its runtime import path is gradio-free).
+- The prebuilt flash-attn wheel is torch2.8 / cu12 / cp312 / sm_80. To target a
+  different GPU/torch, swap the wheel URL in `pyproject.toml`
+  (`[tool.uv.sources]`) and re-run `uv lock`.

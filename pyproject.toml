@@ -1,0 +1,55 @@
+[project]
+name = "nanovllm-dots"
+version = "0.1.0"
+description = "Throughput-optimized inference engine + FastAPI server for dots.tts (MeanFlow)."
+# cp312 only: matches the prebuilt flash-attn wheel + the dots.tts <3.13 constraint.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # --- engine / model ---
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "flash-attn",                       # prebuilt wheel, see [tool.uv.sources]
+    "transformers==4.57.0",             # pinned: 4.57 is validated; 5.x breaks Qwen2/dots_tts
+    "huggingface-hub>=0.36",
+    "safetensors>=0.7",
+    "einops>=0.8",
+    "torchdiffeq>=0.2.5",
+    "numpy>=2.2.6",
+    "scipy>=1.16",
+    "xxhash>=3.7",
+    # --- audio I/O ---
+    "librosa>=0.11.0",
+    "soundfile>=0.13.1",
+    # --- the vendored dots.tts reference is installed separately (--no-deps) to skip
+    #     its WeTextProcessing/pynini dep, which this project stubs via stubs/tn.
+    #     Its actual runtime deps are listed here so they end up in the lock: ---
+    "loguru>=0.7",
+    "langcodes[data]>=3.5",
+    "lingua-language-detector>=2.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    # --- HTTP serving ---
+    "fastapi>=0.136",
+    "uvicorn>=0.49",
+    "pydantic>=2.12,<3",
+]
+
+# Non-packaged project: uv only manages the dependency environment; the source
+# tree (nanovllm_dots/, deployment/) is used directly via PYTHONPATH, not built
+# into a wheel. So no build backend / package discovery is needed.
+[tool.uv]
+package = false
+
+# torch/torchaudio +cu126 come from the PyTorch CUDA 12.6 index (A100 = sm_80).
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+# Prebuilt flash-attn wheel (torch2.8 / cu12 / cp312 / cxx11abiTRUE) -- avoids a
+# multi-hour nvcc compile. From the Dao-AILab v2.8.3 release.
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
