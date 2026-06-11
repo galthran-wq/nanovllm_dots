@@ -8,7 +8,8 @@ sequence onto the shared KV-cache.
 
 How it fits into the engine
 ---------------------------
-The engine operates in a tight loop (see :class:`~nanovllm_dots.engine.llm_engine.LLMEngineBase`):
+The engine operates in a tight loop (``DotsBatchEngine`` in
+:mod:`nanovllm_dots.models.dots.engine`):
 
 1) Users (or model-specific engines) construct a :class:`Sequence` from an input
    prompt and enqueue it into :class:`~nanovllm_dots.engine.scheduler.Scheduler`.
@@ -17,9 +18,9 @@ The engine operates in a tight loop (see :class:`~nanovllm_dots.engine.llm_engin
 3) :class:`~nanovllm_dots.engine.block_manager.BlockManager` allocates/free KV
    blocks and fills ``Sequence.block_table`` (physical block ids used by the
    Attention KV-cache).
-4) The model-specific engine converts :class:`Sequence` ->
-   :class:`~nanovllm_dots.engine.model_runner.RunnerTask` (runner-friendly
-   view) and later merges outputs back into the :class:`Sequence`.
+4) The model-specific engine (``DotsBatchEngine``) converts :class:`Sequence`
+   into its packed batch tensors and later merges outputs back into the
+   :class:`Sequence`.
 
 Key fields
 ----------
