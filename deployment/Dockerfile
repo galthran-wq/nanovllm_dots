@@ -44,15 +44,14 @@ RUN uv sync --frozen --no-dev --no-cache
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH
 
-# Vendored dots.tts reference, installed --no-deps: its pyproject pins
-# WeTextProcessing (pynini/OpenFst, a heavy native build) which this project
-# replaces with the lightweight stubs/tn package on PYTHONPATH; its real runtime
-# deps are already locked and the runtime import path is gradio-free. Own layer
-# (before the app COPY) so editing engine/server code doesn't rebuild it.
-COPY reference/dots.tts /app/reference/dots.tts
-RUN uv pip install --no-deps --no-cache /app/reference/dots.tts
+# NOTE: the reference dots_tts package is NOT installed -- the model is now
+# reimplemented natively in nanovllm_dots/models/dots/native, so the server has no
+# runtime dependency on it. The native input pipeline still uses the `tn` stub
+# (stubs/, on PYTHONPATH) plus lingua/langcodes/loguru/librosa (all in the lock).
+# reference/dots.tts remains a dev/test-only dependency (the test suite's reference
+# fixture) and is excluded from the image via .dockerignore.
 
-# Project source (engine, HTTP layer, tn stubs).
+# Project source (engine, HTTP layer, native model, tn stubs).
 COPY . /app
 
 # stubs/ provides the `tn` stand-in; repo root is importable for nanovllm_dots

@@ -26,7 +26,7 @@ import torch
 from einops import rearrange
 from flash_attn import flash_attn_with_kvcache
 
-from dots_tts.modules.backbone.layers import apply_rotary_pos_emb
+from nanovllm_dots.models.dots.native.layers import apply_rotary_pos_emb
 from nanovllm_dots.models.dots.cached_fm import (
     modulate, block_modulation, final_velocity,
 )

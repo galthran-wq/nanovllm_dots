@@ -66,8 +66,10 @@ curl -s -X POST localhost:8000/generate \
 
 ## Docker
 
-The vendored reference (`reference/dots.tts`) and `stubs/` must be present in the
-build context (they are, in this repo). Weights are mounted, not baked.
+The model is reimplemented natively (`nanovllm_dots/models/dots/native`), so the
+image has **no runtime dependency on the reference `dots_tts` package** — only
+`stubs/` (the `tn` stand-in) must be present in the build context. Weights are
+mounted, not baked.
 
 ```bash
 docker build -f deployment/Dockerfile -t dots-tts .
@@ -88,9 +90,9 @@ Needs the NVIDIA Container Toolkit on the host (for `--gpus`).
   dependency is the NVIDIA *driver* (injected by `--gpus`). A CUDA base would ship
   a second, redundant copy of CUDA (it made the image ~36 GB).
 - Deps via `uv sync --frozen --no-cache` from `uv.lock` (`--no-cache` keeps uv's
-  ~7 GB wheel cache out of the image); the vendored `reference/dots.tts` is then
-  `uv pip install --no-deps`'d (its WeTextProcessing dep is stubbed by `stubs/tn`,
-  and its runtime import path is gradio-free).
+  ~7 GB wheel cache out of the image). The reference `dots_tts` package is NOT
+  installed — the model is native; the input pipeline's `tn` text-normalizer is
+  the lightweight `stubs/tn` stand-in (on PYTHONPATH).
 - The prebuilt flash-attn wheel is torch2.8 / cu12 / cp312 / sm_80. To target a
   different GPU/torch, swap the wheel URL in `pyproject.toml`
   (`[tool.uv.sources]`) and re-run `uv lock`.

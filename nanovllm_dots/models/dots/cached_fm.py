@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torchdiffeq import odeint
 
-from dots_tts.modules.backbone.layers import apply_rotary_pos_emb
+from nanovllm_dots.models.dots.native.layers import apply_rotary_pos_emb
 
 
 # --------------------------------------------------------------------------- #
