@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Async server benchmark: TTFB, RTF, RPS vs concurrency (Phase 3).
+"""Async server benchmark: TTFB, RTF, RPS vs concurrency.
 
 Drives DotsStreamServer with N concurrent streaming generate() coroutines (one
 shared batched engine) and measures, per request: time-to-first-byte (first audio

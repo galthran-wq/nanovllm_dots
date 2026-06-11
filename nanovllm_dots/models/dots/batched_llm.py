@@ -14,9 +14,9 @@ only twist is that decode inputs are *embeddings* (from the patch encoder), not
 token ids, so the driver consumes `inputs_embeds` directly.
 
 The per-sequence inputs (`block_table`, `num_cached_tokens`, `seq_length`) are
-exactly what `engine.sequence.Sequence` exposes, so the Phase-1 `DotsBatchEngine`
+exactly what `engine.sequence.Sequence` exposes, so the `DotsBatchEngine`
 feeds this straight from the scheduler/block-manager. CUDA-graph capture is a
-Phase-2 concern; this runs eager.
+later-stage concern; this runs eager.
 """
 from __future__ import annotations
 

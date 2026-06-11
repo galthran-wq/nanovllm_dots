@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1, step 1: validate the ported Qwen2 LLM backbone in isolation.
+"""Validate the ported Qwen2 LLM backbone in isolation.
 
 Runs a single-sequence prefill through the engine `QwenLLM` (paged Attention,
 flash-attn varlen, no KV cache / no prefix cache) and compares the final hidden

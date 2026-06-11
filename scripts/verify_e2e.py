@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1, step 3: end-to-end validation of the paged LLM inside dots.tts.
+"""End-to-end validation of the paged LLM inside dots.tts.
 
 Strategy: run the *reference* dots generation loop unchanged
 (`runtime.model._generate_latents_stream`, eager, fixed seed) but redirect the
@@ -56,7 +56,7 @@ def main() -> None:
                     help="also run HF step_llm and report per-call hidden divergence")
     ap.add_argument("--save-paged-golden", action="store_true",
                     help="write the paged-engine latents to golden/<name>.paged_latents.npy "
-                         "as the self-consistent Phase-2 regression reference")
+                         "as the self-consistent regression reference")
     args = ap.parse_args()
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

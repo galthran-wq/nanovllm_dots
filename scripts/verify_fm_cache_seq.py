@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 step (c): CachedFMHead reproduces the eager FM per call, over a full
+"""CachedFMHead reproduces the eager FM per call, over a full
 real generation.
 
 Methodology (same as verify_fm_compile.py): autoregressive amplification means a

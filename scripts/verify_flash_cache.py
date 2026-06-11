@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 step (e1): FlashCachedFMHead (preallocated cache + flash_attn_with_
+"""FlashCachedFMHead (preallocated cache + flash_attn_with_
 kvcache) is faithful to the eager FM, per ODE eval over a real generation.
 
 Same shared-trajectory methodology as verify_fm_cache_seq.py: drive the eager

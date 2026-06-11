@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2 benchmark: engine throughput vs concurrency.
+"""Engine throughput benchmark vs concurrency.
 
 Measures the DotsBatchEngine's single-stream RTF and aggregate throughput
 (audio-seconds produced per wall-second) at several concurrency levels. This is

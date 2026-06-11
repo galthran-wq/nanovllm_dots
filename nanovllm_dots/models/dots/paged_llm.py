@@ -17,8 +17,8 @@ the next free slots, then attend queries=L against keys=past_len+L. flash-attn
 aligns the shorter query block to the *suffix* of the keys (bottom-right
 causal), which is precisely append semantics.
 
-This class manages a single sequence's paged cache. Phase 1 uses it per-request
-(the batched scheduler comes in Phase 3); the cache layout and append path are
+This class manages a single sequence's paged cache. The single-stream path uses it per-request
+(the batched path lives in batched_llm); the cache layout and append path are
 already the ones the continuous-batching runner will share.
 """
 from __future__ import annotations
