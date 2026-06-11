@@ -1,9 +1,10 @@
 # dots.tts deployment
 
-FastAPI HTTP server for the `nanovllm_dots` dots.tts engine. The serving logic
-(continuous-batching engine + worker thread) lives in
-`nanovllm_dots/models/dots/server.py` (`DotsStreamServer`); this package is the
-thin HTTP layer on top, mirroring the `nano-vllm-voxcpm` `deployment/` layout.
+FastAPI HTTP server for the `nanovllm_dots` dots.tts engine. The async serving
+wrapper (`DotsStreamServer` — continuous-batching engine + worker thread) lives
+in `deployment/app/server.py`; the rest of this package is the thin HTTP layer
+on top, mirroring the `nano-vllm-voxcpm` `deployment/` layout. `nanovllm_dots/`
+is the GPU engine library it drives.
 
 ## Layout
 
@@ -22,8 +23,7 @@ deployment/
 ```
 
 Dependencies are managed with **uv** (`pyproject.toml` + `uv.lock` at the repo
-root). The async engine wrapper `DotsStreamServer` lives in
-`deployment/app/server.py`; `nanovllm_dots/` is the GPU engine library it drives.
+root).
 
 ## API
 
