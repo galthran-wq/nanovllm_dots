@@ -108,3 +108,26 @@ def build_native_vocoder(model_dir: str, *, device="cuda", dtype=torch.float32):
         torch.set_default_dtype(prev)
     load_component(vocoder, ckpt, "")
     return vocoder
+
+
+def build_native_speaker(model_dir: str, *, device="cuda", dtype=torch.float32):
+    """Build + load the native CAM++ speaker x-vector encoder (float32). Used only
+    for voice cloning (extracts the prompt x-vector -> g_cond via core.xvec_proj)."""
+    from .speaker import SpeakerXVectorFeatures
+    cfg = load_config(model_dir)
+    ckpt = os.path.join(model_dir, "speaker_encoder.safetensors")
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            spk = SpeakerXVectorFeatures(
+                sample_rate=cfg["vocoder"]["sample_rate"],
+                campplus_embedding_size=cfg["campplus_embedding_size"],
+                max_audio_seconds=cfg["xvec_max_audio_seconds"]).eval()
+        # torchaudio's Resample builds its kernel buffer outside the device context;
+        # force the whole module (params + buffers) onto the target device.
+        spk = spk.to(device)
+    finally:
+        torch.set_default_dtype(prev)
+    load_component(spk, ckpt, "")
+    return spk
