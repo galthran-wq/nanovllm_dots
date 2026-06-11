@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 step (e3): GraphedFlashCachedFMHead == eager FlashCachedFMHead, PER
+"""GraphedFlashCachedFMHead == eager FlashCachedFMHead, PER
 PATCH.
 
 The graphed head batches the extend over all ODE timesteps, so its flash kernels

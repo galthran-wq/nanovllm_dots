@@ -197,7 +197,7 @@ class GraphedFlashCachedFMHead(FlashCachedFMHead):
 
     All per-patch-varying inputs live in preallocated STATIC buffers (z, hid, pos,
     conditions, seqlens) that the captured graphs read from; each call copies the
-    new values in place then replays. Falls back to eager for the (Phase-1: never)
+    new values in place then replays. Falls back to eager for the (currently never)
     case where a patch's extend isn't exactly `stride` rows.
     """
 

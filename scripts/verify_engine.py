@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1, step 4b: validate the continuous-batching DotsBatchEngine.
+"""Validate the continuous-batching DotsBatchEngine.
 
 Two checks:
   1. SINGLE request through the engine reproduces the paged-golden latents

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 0: generate a golden reference (wav + latents + profile) from the
+"""Generate a golden reference (wav + latents + profile) from the
 reference dots.tts implementation in eager mode, with fixed seeds, so the
 optimized engine can be regression-tested against it.
 

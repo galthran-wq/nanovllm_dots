@@ -1,9 +1,9 @@
-"""Phase-1 continuous-batching engine for dots.tts.
+"""Continuous-batching engine for dots.tts.
 
 Drives the LLM step for many requests at once through the paged-KV engine
 (`BatchedPagedLLM` + the engine `Scheduler`/`BlockManager`), while the heavy
 flow-matching head, patch encoder and vocoder run *per request* from the
-original dots modules (exact, for correctness). Phase 2 replaces the serial
+original dots modules (exact, for correctness). Later work replaces the serial
 per-request FM with a single batched FM call -- the loop shape here is the one
 it fills in.
 
@@ -28,8 +28,8 @@ State isolation: each sequence gets its OWN FM buffers. The reference
 request, aliasing for many), so we build the `_GenerateState` with private
 tensors here.
 
-Phase-1 scope: no prompt-audio conditioning (g_cond=None); eager; latents are
-collected per request (streaming vocoder is Phase 3). Reuses a loaded
+Initial scope: no prompt-audio conditioning (g_cond=None); eager; latents are
+collected per request (streaming vocoder is added later). Reuses a loaded
 `DotsTtsRuntime` for tokenization / schedule building / the non-LLM modules.
 """
 from __future__ import annotations
@@ -489,13 +489,13 @@ class DotsBatchEngine:
                 if st.done_prefill:
                     raise RuntimeError(
                         f"seq {seq.seq_id} re-entered prefill (preemption is not "
-                        "supported in Phase 1; size num_kvcache_blocks to avoid it)."
+                        "supported; size num_kvcache_blocks to avoid it)."
                     )
                 chunk = st.prefill_embed[seq.num_cached_tokens :]
                 if chunk.size(0) == 0:
                     raise RuntimeError(
                         f"seq {seq.seq_id} prefix is fully KV-cached "
-                        "(unsupported in Phase 1: there is no token left to seed patch 0)."
+                        "(unsupported: there is no token left to seed patch 0)."
                     )
                 st.done_prefill = True
             else:

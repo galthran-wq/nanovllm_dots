@@ -1,4 +1,4 @@
-"""Async streaming server around DotsBatchEngine (Phase 3).
+"""Async streaming server around DotsBatchEngine.
 
 The engine is single-threaded and step-driven (step_stream: one continuous-
 batching step -> per-request audio chunk events). This wraps it for concurrent

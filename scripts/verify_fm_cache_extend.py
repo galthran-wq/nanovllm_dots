@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 step (b): incremental cache extend == monolithic prefill.
+"""Incremental cache extend == monolithic prefill.
 
 In real generation the prefix cache is grown patch-by-patch: each patch appends
 the 5 rows (1 hidden + 4 latent) that graduate from "active" to "prefix" via a

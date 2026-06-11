@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.2: validate batched FM == per-request FM on ragged histories.
+"""Validate batched FM == per-request FM on ragged histories.
 
 The engine's single-request path already matches the golden at cosine 1.0
 (proving the unpadded math). The new risk is PADDING: when sequences of

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 step (a): the FM KV-cache primitives reproduce the full DiT forward.
+"""The FM KV-cache primitives reproduce the full DiT forward.
 
 Builds the same single-patch FM input as `verify_fm_split.py` (prefix rows
 [0:L-1] + 5 active rows = last-hidden + latent patch, no padding), then computes

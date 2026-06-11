@@ -2,7 +2,7 @@
 """Per-stage CUDA-time breakdown of the engine's single-stream decode, to see
 where RTF goes AFTER the FM is cudagraphed. Monkeypatches the three stage entry
 points (LLM append_batch, FM _batched_fm, patch_encoder _patch_to_embed) with
-cuda.Event timers. Vocoder is NOT in the engine (latent-only; Phase 3 streaming),
+cuda.Event timers. Vocoder is NOT in the engine (latent-only),
 so it is intentionally absent.
 
 Run:

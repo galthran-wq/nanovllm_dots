@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1, step 4a: validate the batched (continuous-batching) LLM driver.
+"""Validate the batched (continuous-batching) LLM driver.
 
 `BatchedPagedLLM.append_batch` advances many sequences in one varlen flash-attn
 call. Batching must be transparent: each sequence's per-token hidden states must

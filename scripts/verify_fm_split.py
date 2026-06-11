@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 2.6 foundation: prefix/active split of the FM DiT forward.
+"""Prefix/active split of the FM DiT forward.
 
 The big single-stream lever is to stop reprocessing the whole FM history on every
 ODE step of every patch (O(P^2)). The history rows attend only causally (not to

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1, step 2: validate the paged-KV *incremental append* path.
+"""Validate the paged-KV *incremental append* path.
 
 `verify_llm.py` proved a single full-sequence prefill (no cache) matches HF.
 This proves the thing the dots loop actually does: feed the sequence in

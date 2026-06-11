@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Phase 2.3: validate that torch.compile of the FM DiT is numerically faithful.
+"""Validate that torch.compile of the FM DiT is numerically faithful.
 
 The compiled FM produces a valid-but-not-bit-identical sample vs the eager
 golden: inductor reorders bf16 ops (~3% per-call reldiff), and the autoregressive
 FM amplifies that to ~cos 0.93 over a full sequence (eos timing unchanged) --
-exactly the Phase-1 paged-LLM pattern. So we don't compare the *sequence* to the
+exactly the paged-LLM pattern. So we don't compare the *sequence* to the
 eager golden; we check the thing that actually proves faithfulness: the compiled
 DiT forward matches the eager DiT forward on identical inputs, per call.
 
