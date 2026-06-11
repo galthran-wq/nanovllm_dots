@@ -1,0 +1,29 @@
+# Build context lives at the repo root (build with `-f deployment/Dockerfile .`).
+# Keep this small: the engine code (nanovllm_dots), the HTTP layer (deployment),
+# the vendored reference (reference/dots.tts) and the tn stubs (stubs/) are needed;
+# everything heavy is excluded.
+
+# 7.4G local virtualenv -- the image builds its own.
+.venv/
+
+# 18G of model weights -- mounted at runtime (-v ...:/models), never baked.
+/models/
+
+# golden reference audio/latents (dev only).
+golden/
+golden_mf/
+
+# vendored upstream git metadata / build leftovers (KEEP the source itself).
+reference/**/.git/
+reference/dots.tts/assets/
+
+# vcs + python caches
+.git/
+.gitignore
+**/__pycache__/
+*.pyc
+*.egg-info/
+*.log
+
+# claude / planning scratch
+.claude/

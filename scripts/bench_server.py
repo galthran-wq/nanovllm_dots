@@ -51,7 +51,7 @@ async def run_level(server, n, text, num_steps, stream):
 
 
 async def main_async(args):
-    from nanovllm_dots.models.dots.server import DotsStreamServer
+    from deployment.app.server import DotsStreamServer
     server = DotsStreamServer.from_pretrained(
         args.model, max_num_seqs=args.max_num_seqs)
     server.vocode = not args.no_vocode
