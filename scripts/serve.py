@@ -4,7 +4,7 @@
     PYTHONPATH=stubs:. HF_HUB_OFFLINE=1 .venv/bin/python scripts/serve.py \
         --model models/dots.tts-mf --host 0.0.0.0 --port 8000
 
-Endpoints: POST /generate, POST /generate_stream, GET /health.
+Endpoints: GET /health, GET /ready, GET /info, POST /generate, POST /generate_stream.
 One GPU / one engine / one uvicorn worker (the engine batches internally).
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ def main() -> None:
 
     import uvicorn
     # single worker: the engine lives in-process and batches all requests.
-    uvicorn.run("nanovllm_dots.models.dots.app:app", host=args.host,
+    uvicorn.run("deployment.app.main:app", host=args.host,
                 port=args.port, workers=1, log_level="warning")
 
 
