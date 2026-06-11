@@ -186,7 +186,10 @@ def test_decode_path_matches_varlen(make_engine, graph_decode):
 
     bl.append_batch = patched
     try:
+        # two requests of different lengths -> the decode rounds form a ragged
+        # n>1 decode batch (exercises per-row context_lens + the decode graph)
         eng.add_request("r0", EN1, num_steps=4, guidance_scale=1.2)
+        eng.add_request("r1", EN1 + " " + EN1, num_steps=4, guidance_scale=1.2)
         eng.run_all()
     finally:
         bl.append_batch = orig

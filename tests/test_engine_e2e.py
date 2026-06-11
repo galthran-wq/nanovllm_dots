@@ -107,9 +107,15 @@ def test_paged_llm_in_reference_loop(reference, paged):
 def test_engine_reproduces_paged_golden(make_engine):
     """The batch engine (eager FM) reproduces the paged golden for one request;
     the cudagraph FM path is bit-exact; 8 concurrent requests all complete."""
-    if "en1" not in _PAGED_GOLDEN:
-        pytest.skip("paged golden not produced (e2e test skipped/failed)")
-    golden = _PAGED_GOLDEN["en1"]
+    # Prefer the in-session paged golden; fall back to the on-disk artifact the
+    # original verify_engine.py used (keeps this test runnable on its own / under
+    # a randomized or parallel runner).
+    golden = _PAGED_GOLDEN.get("en1")
+    if golden is None:
+        gpath = os.path.join(GOLDEN_DIR, "en1.paged_latents.npy")
+        if not os.path.exists(gpath):
+            pytest.skip("paged golden not available (in-session or on disk)")
+        golden = torch.from_numpy(np.load(gpath)).float()
 
     # (1) single request, eager FM -> reproduces the paged golden (early patches)
     set_seed(1234)
