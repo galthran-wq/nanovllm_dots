@@ -10,8 +10,9 @@ import os
 import torch
 from safetensors import safe_open
 
-from .config import dit_config, load_config
+from .config import PatchEncoderModelConfig, dit_config, load_config
 from .dit import DiT
+from .patch_encoder import VAESemanticEncoder
 
 
 def _keys_with_prefix(safetensors_path: str, prefix: str) -> list[str]:
@@ -64,3 +65,27 @@ def build_native_dit(model_dir: str, *, device="cuda", dtype=torch.bfloat16) -> 
         torch.set_default_dtype(prev)
     load_component(dit, ckpt, "velocity_field_predictor.")
     return dit
+
+
+def _llm_hidden_size(model_dir: str) -> int:
+    import json
+    with open(os.path.join(model_dir, "llm_config.json")) as f:
+        return int(json.load(f)["hidden_size"])
+
+
+def build_native_patch_encoder(model_dir: str, *, device="cuda",
+                               dtype=torch.bfloat16) -> VAESemanticEncoder:
+    """Build + load the native patch_encoder (VAESemanticEncoder) from a model dir."""
+    cfg = load_config(model_dir)
+    ckpt = os.path.join(model_dir, "model.safetensors")
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            pe = VAESemanticEncoder(
+                in_dim=cfg["latent_dim"], out_dim=_llm_hidden_size(model_dir),
+                config=PatchEncoderModelConfig(cfg)).eval()
+    finally:
+        torch.set_default_dtype(prev)
+    load_component(pe, ckpt, "patch_encoder.")
+    return pe

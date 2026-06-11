@@ -18,11 +18,23 @@ class TransformerConfig:
         # e.g. a null rotary_theta must fall back to the layer default, not be passed.
         return {k: v for k, v in self._d.items() if v is not None}
 
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
     def __getattr__(self, name):
         try:
             return self._d[name]
         except KeyError as e:
             raise AttributeError(name) from e
+
+
+class PatchEncoderModelConfig:
+    """Mirrors what VAESemanticEncoder reads from the core config: ``.patch_size``
+    (int) and ``.PatchEncoder`` (a TransformerConfig with attr access + ``.get()``)."""
+
+    def __init__(self, raw: dict):
+        self.patch_size = int(raw["patch_size"])
+        self.PatchEncoder = TransformerConfig(raw["PatchEncoder"])
 
 
 def load_config(model_dir: str) -> dict:
